@@ -111,10 +111,23 @@ async fn upload_prekeys_wrong_user_is_403() {
     assert_eq!(resp.status().as_u16(), 403);
 
     // Alice can upload to her own slot → 204.
+    let alice_identity = IdentityKeyPair::generate();
+    let alice_spk = SignedPreKey::generate(1);
+    let alice_bundle = PreKeyBundle {
+        identity_key: alice_identity.dh_public(),
+        identity_key_ed: alice_identity.public().verifying,
+        signed_prekey: alice_spk.public(),
+        signed_prekey_id: alice_spk.id,
+        signed_prekey_sig: alice_spk.sign(&alice_identity),
+        one_time_prekey: None,
+        one_time_prekey_id: None,
+        pq_spk_public: None,
+        pq_spk_sig: None,
+    };
     let resp = common::http_client()
         .put(format!("http://{addr}/api/v1/users/{alice_id}/prekeys"))
         .header("Authorization", format!("Bearer {alice_token}"))
-        .body(b"fakebundle".as_ref())
+        .body(encode_bundle(&alice_bundle))
         .send()
         .await
         .unwrap();
