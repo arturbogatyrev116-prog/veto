@@ -721,6 +721,7 @@
   }
 
   async function stopAndSendVoice(cancel = false) {
+    clearInterval(recTicker); recTicker = null; recSeconds = 0
     if (!mediaRecorder) { recState = 'idle'; return }
     mediaRecorder.stream.getTracks().forEach(t => t.stop())
     if (cancel || recChunks.length === 0) {
@@ -732,13 +733,19 @@
     await sendMediaBlob(blob, 'voice.webm', 'audio/webm')
   }
 
+  let recSeconds = 0
+  let recTicker = null
+
   function onMicPointerDown(e) {
+    e.currentTarget.setPointerCapture(e.pointerId)  // track swipe outside button
     recStartY = e.clientY
     recStartX = e.clientX
     recSwipeDy = 0
     recPressTimer = setTimeout(() => {
       recPressTimer = null
       startVoice()
+      recSeconds = 0
+      recTicker = setInterval(() => recSeconds++, 1000)
     }, LONG_PRESS_MS)
   }
 
@@ -748,7 +755,10 @@
     const dx = recStartX - e.clientX   // positive = moved left
     recSwipeDy = dy
     if (recState === 'voice' && dy > 50) recState = 'voice-locked'
-    if ((recState === 'voice' || recState === 'voice-locked') && dx > 100) stopAndSendVoice(true)
+    if ((recState === 'voice' || recState === 'voice-locked') && dx > 100) {
+      clearInterval(recTicker); recTicker = null
+      stopAndSendVoice(true)
+    }
   }
 
   function onMicPointerUp() {
@@ -759,8 +769,15 @@
       openVideoModal()
       return
     }
-    if (recState === 'voice') stopAndSendVoice(false)
+    if (recState === 'voice') {
+      clearInterval(recTicker); recTicker = null
+      stopAndSendVoice(false)
+    }
     // voice-locked: ignore pointerup, user stops via stop button
+  }
+
+  function fmtRecTime(s) {
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
   }
 
   async function openVideoModal() {
@@ -1235,6 +1252,7 @@
       style="display:none"
       on:change={onFileSelected}
     />
+    {#if recState === 'idle'}
     <button
       type="button"
       class="attach-btn"
@@ -1254,6 +1272,20 @@
       on:blur={onBlur}
       use:autoResize
     />
+    {/if}
+    <!-- Recording indicator (replaces textarea row while recording) -->
+    {#if recState === 'voice' || recState === 'voice-locked'}
+      <div class="rec-bar">
+        <span class="rec-dot"></span>
+        <span class="rec-time">{fmtRecTime(recSeconds)}</span>
+        {#if recState === 'voice'}
+          <span class="rec-hint">← swipe to cancel · ↑ lock</span>
+        {:else}
+          <span class="rec-hint locked-hint">🔒 locked</span>
+        {/if}
+      </div>
+    {/if}
+
     <!-- Mic button: hold = voice, tap = video -->
     <button
       type="button"
@@ -1265,12 +1297,12 @@
       on:pointerdown|preventDefault={onMicPointerDown}
       on:pointermove={onMicPointerMove}
       on:pointerup={onMicPointerUp}
-      on:pointercancel={() => stopAndSendVoice(true)}
+      on:pointercancel={() => { clearInterval(recTicker); recTicker = null; stopAndSendVoice(true) }}
     >
       {#if recState === 'voice-locked'}🔒{:else}🎙{/if}
     </button>
     {#if recState === 'voice-locked'}
-      <button type="button" class="rec-stop-btn" on:click={() => stopAndSendVoice(false)}>Send</button>
+      <button type="button" class="rec-stop-btn" on:click={() => { clearInterval(recTicker); recTicker = null; stopAndSendVoice(false) }}>Send</button>
     {/if}
     {#if recState === 'idle'}
       <button type="submit" disabled={sending || !text.trim()}>Send</button>
@@ -2103,4 +2135,28 @@
     font-size: 11px; font-weight: 700; color: #f38ba8;
     animation: mic-pulse 1s infinite;
   }
+
+  /* ── Recording bar (inline, replaces textarea hint) ─────────────────────── */
+  .rec-bar {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 4px;
+    min-height: 36px;
+    align-self: flex-end;
+  }
+  .rec-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #f38ba8; flex-shrink: 0;
+    animation: mic-pulse 1s infinite;
+  }
+  .rec-time {
+    font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums;
+    color: var(--text); min-width: 36px;
+  }
+  .rec-hint {
+    font-size: 11px; color: var(--text-dim); flex: 1;
+  }
+  .locked-hint { color: #a6e3a1; }
 </style>

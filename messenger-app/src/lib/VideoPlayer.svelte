@@ -25,27 +25,30 @@
   $: thumbUrl = getThumbnailUrl(msgKey, msg.thumb_data)
 </script>
 
-<div class="video-msg">
+<div class="circle-wrap">
   {#if videoUrl}
     <!-- svelte-ignore a11y-media-has-caption -->
-    <video class="video-el" controls src={videoUrl} poster={thumbUrl ?? undefined}></video>
+    <video class="circle-video" controls src={videoUrl} poster={thumbUrl ?? undefined}></video>
   {:else}
-    <button class="video-thumb-btn" on:click={load} disabled={loading || err}>
+    <button class="circle-thumb" on:click={load} disabled={loading || err} aria-label="Play video">
       {#if thumbUrl}
-        <img class="video-thumb" src={thumbUrl} alt="video" />
-        <span class="video-play-icon">{loading ? '…' : err ? '✕' : '▶'}</span>
+        <img class="circle-img" src={thumbUrl} alt="" />
       {:else}
-        <span class="video-no-thumb">{loading ? '…' : err ? 'Failed' : '▶ Video message'}</span>
+        <div class="circle-placeholder"></div>
       {/if}
+      <span class="circle-play">
+        {#if loading}⏳{:else if err}✕{:else}▶{/if}
+      </span>
     </button>
   {/if}
-  <div class="video-footer">
+
+  <div class="circle-footer">
     {#if msg.file_size}
-      <span class="file-size">{Math.round(msg.file_size / 1024)} KB</span>
+      <span class="dur">{Math.round(msg.file_size / 1024)} KB</span>
     {/if}
     {#if msg.file_key}
       <button
-        class="file-dl-btn"
+        class="dl-btn"
         title="Download"
         disabled={downloadingFiles[msg.file_id]}
         on:click={() => downloadFile(msg)}
@@ -55,38 +58,54 @@
 </div>
 
 <style>
-  .video-msg { display: flex; flex-direction: column; gap: 4px; max-width: 280px; padding: 2px 0 4px; }
-  .video-el {
-    width: 100%; max-width: 280px; border-radius: 8px;
-    background: #000; display: block;
+  .circle-wrap { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; padding: 2px 0; }
+
+  .circle-video,
+  .circle-thumb,
+  .circle-img,
+  .circle-placeholder {
+    width: 200px;
+    height: 200px;
+    border-radius: 50%;
+    object-fit: cover;
+    display: block;
   }
-  .video-thumb-btn {
-    position: relative; background: none; padding: 0;
-    border-radius: 8px; overflow: hidden; cursor: pointer;
-    display: block; width: 100%;
+
+  .circle-video { background: #000; }
+
+  .circle-thumb {
+    position: relative;
+    padding: 0;
+    background: none;
+    border: none;
+    cursor: pointer;
+    overflow: hidden;
+    flex-shrink: 0;
   }
-  .video-thumb {
-    width: 100%; max-width: 280px; border-radius: 8px;
-    display: block; object-fit: cover; aspect-ratio: 4/3;
-    background: #111;
-  }
-  .video-play-icon {
-    position: absolute; inset: 0;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 32px; color: #fff;
+  .circle-thumb:disabled { cursor: default; }
+
+  .circle-placeholder { background: rgba(0,0,0,0.3); }
+
+  .circle-play {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 36px;
+    color: #fff;
     text-shadow: 0 2px 8px rgba(0,0,0,0.7);
-    background: rgba(0,0,0,0.2);
+    background: rgba(0,0,0,0.18);
+    border-radius: 50%;
+    transition: background 0.15s;
   }
-  .video-no-thumb {
-    display: flex; align-items: center; justify-content: center;
-    width: 200px; height: 120px; border-radius: 8px;
-    background: rgba(0,0,0,0.2); font-size: 13px; color: inherit;
+  .circle-thumb:hover:not(:disabled) .circle-play { background: rgba(0,0,0,0.35); }
+
+  .circle-footer { display: flex; align-items: center; gap: 4px; padding: 0 4px; }
+  .dur { font-size: 10px; opacity: 0.6; }
+  .dl-btn {
+    background: none; color: inherit; font-size: 13px;
+    padding: 1px 4px; border-radius: 4px; opacity: 0.7;
   }
-  .video-footer { display: flex; align-items: center; gap: 4px; }
-  .file-size { font-size: 10px; opacity: 0.6; flex: 1; }
-  .file-dl-btn {
-    background: none; color: inherit; font-size: 14px;
-    padding: 2px 5px; border-radius: 4px; opacity: 0.7; flex-shrink: 0;
-  }
-  .file-dl-btn:hover:not(:disabled) { background: rgba(0,0,0,0.12); opacity: 1; }
+  .dl-btn:hover:not(:disabled) { background: rgba(0,0,0,0.12); opacity: 1; }
 </style>
