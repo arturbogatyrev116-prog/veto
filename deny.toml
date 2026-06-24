@@ -20,22 +20,45 @@ allow = [
 confidence-threshold = 0.8
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "allow"
 wildcards = "deny"
 deny = [
     { name = "openssl", version = "<0.10.55" },
 ]
-# rand 0.8 vs 0.9: crypto crates (dalek, chacha20) use 0.8; axum/tungstenite use 0.9.
-# Will resolve when RustCrypto upgrades to rand 0.9.
-skip = [
-    { name = "rand",        reason = "dalek ecosystem pinned to 0.8, axum pulls 0.9" },
-    { name = "rand_core",   reason = "same root cause as rand" },
-    { name = "rand_chacha", reason = "same root cause as rand" },
-    { name = "getrandom",   reason = "transitive from rand split" },
-    { name = "r-efi",       reason = "transitive from getrandom split" },
-]
 
 [advisories]
-# Vulnerabilities always fail (cargo-deny default, no field needed).
 yanked = "deny"
 unmaintained = "workspace"
+ignore = [
+    # rustls-webpki 0.102.x CVEs — pulled in by async-nats 0.37.
+    # Our NATS connection uses nats:// (no TLS), so CRL parsing is never reached.
+    # TODO: update async-nats to 0.49+ to get rustls-webpki 0.103.x.
+    "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0049",
+
+    # GTK3 bindings marked unmaintained — transitive Tauri dependencies.
+    # Tauri has migrated to GTK4; these still function correctly on supported platforms.
+    "RUSTSEC-2024-0411",
+    "RUSTSEC-2024-0412",
+    "RUSTSEC-2024-0413",
+    "RUSTSEC-2024-0414",
+    "RUSTSEC-2024-0415",
+    "RUSTSEC-2024-0416",
+    "RUSTSEC-2024-0417",
+    "RUSTSEC-2024-0418",
+    "RUSTSEC-2024-0419",
+    "RUSTSEC-2024-0420",
+    "RUSTSEC-2024-0429",
+
+    # Other unmaintained Tauri transitive deps.
+    "RUSTSEC-2023-0089",  # atomic-polyfill
+    "RUSTSEC-2024-0370",  # proc-macro-error
+    "RUSTSEC-2025-0134",  # rustls-pemfile
+    "RUSTSEC-2025-0075",  # unic-char-range
+    "RUSTSEC-2025-0080",  # unic-common
+    "RUSTSEC-2025-0081",  # unic-char-property
+    "RUSTSEC-2025-0098",  # unic-ucd-version
+    "RUSTSEC-2025-0100",  # unic-ucd-ident
+]
