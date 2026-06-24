@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="vGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#B87BFF;stop-opacity:1"/>
+      <stop offset="100%" style="stop-color:#9D4EDD;stop-opacity:1"/>
+    </linearGradient>
+    <clipPath id="roundedClip">
+      <rect width="1024" height="1024" rx="220" ry="220"/>
+    </clipPath>
+  </defs>
+
+  <!-- Dark background -->
+  <rect width="1024" height="1024" rx="220" ry="220" fill="#0D1117"/>
+
+  <!-- Logo centered, scaled 4x (original 256 → 1024, with padding ~112px each side = 800px usable) -->
+  <g transform="translate(112, 140) scale(3.125)">
+    <!-- Top triangle -->
+    <path d="M128 32 L172 100 L84 100 Z"
+          fill="none"
+          stroke="#00B4A0"
+          stroke-width="10"
+          stroke-linejoin="round"
+          stroke-linecap="round"/>
+
+    <!-- Left triangle -->
+    <path d="M68 120 L112 188 L24 188 Z"
+          fill="none"
+          stroke="#00B4A0"
+          stroke-width="10"
+          stroke-linejoin="round"
+          stroke-linecap="round"/>
+
+    <!-- Right triangle -->
+    <path d="M188 120 L232 188 L144 188 Z"
+          fill="none"
+          stroke="#00B4A0"
+          stroke-width="10"
+          stroke-linejoin="round"
+          stroke-linecap="round"/>
+
+    <!-- Center V -->
+    <path d="M108 100 L118 172 L128 172 L148 100 L140 100 L128 144 L116 100 Z"
+          fill="url(#vGrad)"/>
+  </g>
+</svg>

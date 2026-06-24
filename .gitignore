@@ -1,0 +1,37 @@
+# Build artifacts
+target/
+node_modules/
+dist/
+icon-build/
+messenger-app/src-tauri/target/
+messenger-app/node_modules/
+messenger-app/dist/
+admin-ui/node_modules/
+admin-ui/dist/
+
+# Secrets & local config
+.env
+.env.local
+messenger-app/server_url.txt
+
+# Server management scripts (contain SSH credentials — use veto_credentials.example.py)
+veto_server.py
+upload_and_deploy.py
+start-server.bat
+stop-server.bat
+
+# Research notes (private)
+messenger_research_2026*.md
+
+# Binaries
+*.exe
+*.msi
+*.dmg
+*.deb
+*.AppImage
+*.ico
+*.icns
+
+# OS
+.DS_Store
+Thumbs.db

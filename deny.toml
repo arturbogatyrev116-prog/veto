@@ -1,0 +1,39 @@
+[graph]
+all-features = false
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Zlib",
+    "OpenSSL",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    { name = "openssl", version = "<0.10.55" },
+]
+# rand 0.8 vs 0.9: crypto crates (dalek, chacha20) use 0.8; axum/tungstenite use 0.9.
+# Will resolve when RustCrypto upgrades to rand 0.9.
+skip = [
+    { name = "rand",        reason = "dalek ecosystem pinned to 0.8, axum pulls 0.9" },
+    { name = "rand_core",   reason = "same root cause as rand" },
+    { name = "rand_chacha", reason = "same root cause as rand" },
+    { name = "getrandom",   reason = "transitive from rand split" },
+    { name = "r-efi",       reason = "transitive from getrandom split" },
+]
+
+[advisories]
+# Vulnerabilities always fail (cargo-deny default, no field needed).
+yanked = "deny"
+unmaintained = "workspace"

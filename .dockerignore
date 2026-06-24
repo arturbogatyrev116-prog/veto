@@ -1,0 +1,7 @@
+target/
+messenger-app/src-tauri/target/
+messenger-app/node_modules/
+messenger-app/dist/
+.git/
+.env.local
+*.bat

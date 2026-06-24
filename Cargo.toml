@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "messenger-crypto",
+    "messenger-server",
+    "messenger-app/src-tauri",
+]
+resolver = "2"

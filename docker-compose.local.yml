@@ -1,0 +1,53 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: messenger
+      POSTGRES_USER: messenger
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local_dev_secret}
+    volumes:
+      - postgres_data_local:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U messenger"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  nats:
+    image: nats:2.11-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222", "--cluster_name", "messenger"]
+    volumes:
+      - nats_data_local:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8222/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  server:
+    build:
+      context: .
+      dockerfile: messenger-server/Dockerfile
+    environment:
+      DATABASE_URL: postgres://messenger:${POSTGRES_PASSWORD:-local_dev_secret}@postgres/messenger
+      NATS_URL: nats://nats:4222
+      RUST_LOG: messenger_server=info,tower_http=warn
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-changeme}
+      ADMIN_UI_DIR: /app/admin-ui
+      # No TLS vars → runs plain HTTP on port 3000
+    volumes:
+      - ./admin-ui/dist:/app/admin-ui:ro
+    ports:
+      - "${BIND_PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data_local:
+  nats_data_local:

@@ -1,0 +1,75 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-messenger}
+      POSTGRES_USER: ${POSTGRES_USER:-messenger}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-messenger}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nats:
+    image: nats:2.11-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222", "--cluster_name", "messenger"]
+    volumes:
+      - nats_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8222/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  server:
+    image: ${SERVER_IMAGE:-messenger-server:latest}
+    build:
+      context: .
+      dockerfile: messenger-server/Dockerfile
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-messenger}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB:-messenger}
+      NATS_URL: nats://nats:4222
+      RUST_LOG: messenger_server=info,tower_http=warn
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?ADMIN_TOKEN must be set}
+      # TLS — choose one:
+      # Option A: provide existing cert/key files
+      TLS_CERT_PATH: ${TLS_CERT_PATH:-}
+      TLS_KEY_PATH: ${TLS_KEY_PATH:-}
+      # Option B: auto-generate self-signed (for testing only)
+      TLS_SELF_SIGNED: ${TLS_SELF_SIGNED:-}
+      # Self-registration: set REGISTRATION_OPEN=1 in .env to allow
+      REGISTRATION_OPEN: ${REGISTRATION_OPEN:-}
+      ADMIN_UI_DIR: /admin-ui
+    volumes:
+      - ${CERTS_DIR:-./certs}:/certs:ro
+      - ./admin-ui/dist:/admin-ui:ro
+    ports:
+      - "${BIND_PORT:-443}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Uptime Kuma — self-hosted monitoring dashboard with Telegram alerts
+  # Access via SSH tunnel: ssh -L 3001:localhost:3001 root@server
+  # Or open port 3001 in firewall for direct access (restrict by IP if public)
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: uptime-kuma
+    ports:
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - uptime_kuma_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  nats_data:
+  uptime_kuma_data:
