@@ -6,6 +6,8 @@
   import { conversations, activeConv, user, peerNames, typingPeers, addMessage, addGroupMessage, removeMessage, onlinePeers, unlocked, groups, unreadCounts, reactions } from '../stores.js'
   import Avatar from './Avatar.svelte'
   import SafetyNumbers from './SafetyNumbers.svelte'
+  import AudioPlayer from './AudioPlayer.svelte'
+  import VideoPlayer from './VideoPlayer.svelte'
 
   export let peerId
 
@@ -687,6 +689,168 @@
     typingTimer = null
   }
 
+  // ── Voice / Video recording ────────────────────────────────────────────────
+
+  // recState: 'idle' | 'voice' | 'voice-locked' | 'video'
+  let recState = 'idle'
+  let mediaRecorder = null
+  let recChunks = []
+  let recStartY = 0
+  let recStartX = 0
+  let recSwipeDy = 0   // positive = up
+  let recPressTimer = null
+  const LONG_PRESS_MS = 300
+
+  // Video modal
+  let showVideoModal = false
+  let videoPreviewEl = null
+  let videoStream = null
+  let videoRecording = false
+
+  async function startVoice() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      recChunks = []
+      mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' })
+      mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recChunks.push(e.data) }
+      mediaRecorder.start()
+      recState = 'voice'
+    } catch {
+      recState = 'idle'
+    }
+  }
+
+  async function stopAndSendVoice(cancel = false) {
+    if (!mediaRecorder) { recState = 'idle'; return }
+    mediaRecorder.stream.getTracks().forEach(t => t.stop())
+    if (cancel || recChunks.length === 0) {
+      mediaRecorder = null; recChunks = []; recState = 'idle'; return
+    }
+    await new Promise(r => { mediaRecorder.onstop = r; mediaRecorder.stop() })
+    const blob = new Blob(recChunks, { type: 'audio/webm' })
+    mediaRecorder = null; recChunks = []; recState = 'idle'
+    await sendMediaBlob(blob, 'voice.webm', 'audio/webm')
+  }
+
+  function onMicPointerDown(e) {
+    recStartY = e.clientY
+    recStartX = e.clientX
+    recSwipeDy = 0
+    recPressTimer = setTimeout(() => {
+      recPressTimer = null
+      startVoice()
+    }, LONG_PRESS_MS)
+  }
+
+  function onMicPointerMove(e) {
+    if (recState === 'idle') return
+    const dy = recStartY - e.clientY   // positive = moved up
+    const dx = recStartX - e.clientX   // positive = moved left
+    recSwipeDy = dy
+    if (recState === 'voice' && dy > 50) recState = 'voice-locked'
+    if ((recState === 'voice' || recState === 'voice-locked') && dx > 100) stopAndSendVoice(true)
+  }
+
+  function onMicPointerUp() {
+    if (recPressTimer !== null) {
+      // Short tap → open video
+      clearTimeout(recPressTimer)
+      recPressTimer = null
+      openVideoModal()
+      return
+    }
+    if (recState === 'voice') stopAndSendVoice(false)
+    // voice-locked: ignore pointerup, user stops via stop button
+  }
+
+  async function openVideoModal() {
+    try {
+      videoStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+      showVideoModal = true
+      await tick()
+      if (videoPreviewEl) { videoPreviewEl.srcObject = videoStream }
+    } catch { videoStream = null }
+  }
+
+  function closeVideoModal(cancel = true) {
+    if (videoRecording && mediaRecorder) stopAndSendVoice(cancel)
+    videoStream?.getTracks().forEach(t => t.stop())
+    videoStream = null
+    videoRecording = false
+    showVideoModal = false
+    mediaRecorder = null
+    recChunks = []
+  }
+
+  async function startVideoRec() {
+    if (!videoStream) return
+    recChunks = []
+    const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+      ? 'video/webm;codecs=vp9,opus'
+      : 'video/webm'
+    mediaRecorder = new MediaRecorder(videoStream, { mimeType: mime })
+    mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recChunks.push(e.data) }
+    mediaRecorder.start()
+    videoRecording = true
+  }
+
+  async function stopVideoRec() {
+    if (!mediaRecorder) return
+    await new Promise(r => { mediaRecorder.onstop = r; mediaRecorder.stop() })
+    const blob = new Blob(recChunks, { type: 'video/webm' })
+    let thumbBytes = null
+    try {
+      // Grab first frame for thumbnail
+      const url = URL.createObjectURL(blob)
+      const vid = document.createElement('video')
+      vid.src = url
+      vid.muted = true
+      await new Promise(r => { vid.onloadeddata = r; vid.load() })
+      await new Promise(r => { vid.onseeked = r; vid.currentTime = 0.1 })
+      const canvas = document.createElement('canvas')
+      canvas.width = Math.min(vid.videoWidth, 320)
+      canvas.height = Math.round(vid.videoHeight * canvas.width / vid.videoWidth)
+      canvas.getContext('2d').drawImage(vid, 0, 0, canvas.width, canvas.height)
+      const thumbBlob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.8))
+      thumbBytes = Array.from(new Uint8Array(await thumbBlob.arrayBuffer()))
+      URL.revokeObjectURL(url)
+    } catch {}
+    mediaRecorder = null; recChunks = []; videoRecording = false
+    closeVideoModal(false)
+    await sendMediaBlob(blob, 'video.webm', 'video/webm', thumbBytes)
+  }
+
+  async function sendMediaBlob(blob, fileName, mimeType, thumbBytes = null) {
+    sending = true; error = ''
+    try {
+      const fileBytes = Array.from(new Uint8Array(await blob.arrayBuffer()))
+      if (isGroup) {
+        const { file_id, file_key } = await invoke('send_group_file', {
+          groupId: peerId, fileBytes, fileName, mimeType, thumbBytes,
+        })
+        addGroupMessage(peerId, {
+          from: $user.user_id, text: '', ts: Date.now(), status: 'sent',
+          group_id: peerId, sender_id: $user.user_id,
+          reply_to_ts: null, reply_to_from: null, reply_to_text: null,
+          file_id, file_key, file_name: fileName, file_mime: mimeType,
+          file_size: blob.size, thumb_data: thumbBytes,
+        })
+      } else {
+        const { id, file_id, file_key } = await invoke('send_file', {
+          peerId, fileBytes, fileName, mimeType, thumbBytes,
+        })
+        addMessage(peerId, {
+          from: $user.user_id, text: '', ts: Date.now(), id, status: 'sent',
+          reply_to_ts: null, reply_to_from: null, reply_to_text: null,
+          file_id, file_key, file_name: fileName, file_mime: mimeType,
+          file_size: blob.size, thumb_data: thumbBytes,
+        })
+      }
+      await tick(); scrollBottom()
+    } catch (e) { error = String(e) }
+    finally { sending = false }
+  }
+
   // ── Auto-resize textarea ───────────────────────────────────────────────────
 
   function autoResize(node) {
@@ -873,7 +1037,11 @@
               </div>
             {/if}
             {#if m.file_id || m.file_name}
-              {#if m.file_mime?.startsWith('image/')}
+              {#if m.file_mime?.startsWith('audio/')}
+                <AudioPlayer msg={m} {downloadFile} {downloadingFiles} />
+              {:else if m.file_mime?.startsWith('video/')}
+                <VideoPlayer msg={m} {downloadFile} {downloadingFiles} {getThumbnailUrl} {msgKey} />
+              {:else if m.file_mime?.startsWith('image/')}
                 {@const thumbUrl = getThumbnailUrl(msgKey, m.thumb_data)}
                 {#if thumbUrl}
                   <div class="thumb-wrap">
@@ -1086,7 +1254,27 @@
       on:blur={onBlur}
       use:autoResize
     />
-    <button type="submit" disabled={sending || !text.trim()}>Send</button>
+    <!-- Mic button: hold = voice, tap = video -->
+    <button
+      type="button"
+      class="mic-btn"
+      class:recording={recState === 'voice' || recState === 'voice-locked'}
+      class:locked={recState === 'voice-locked'}
+      title="Hold for voice · tap for video"
+      disabled={sending}
+      on:pointerdown|preventDefault={onMicPointerDown}
+      on:pointermove={onMicPointerMove}
+      on:pointerup={onMicPointerUp}
+      on:pointercancel={() => stopAndSendVoice(true)}
+    >
+      {#if recState === 'voice-locked'}🔒{:else}🎙{/if}
+    </button>
+    {#if recState === 'voice-locked'}
+      <button type="button" class="rec-stop-btn" on:click={() => stopAndSendVoice(false)}>Send</button>
+    {/if}
+    {#if recState === 'idle'}
+      <button type="submit" disabled={sending || !text.trim()}>Send</button>
+    {/if}
   </form>
 
   {#if error}
@@ -1170,6 +1358,34 @@
 
 {#if showSafetyNumbers && !isGroup}
   <SafetyNumbers {peerId} {peerName} on:close={() => showSafetyNumbers = false} />
+{/if}
+
+<!-- Video recording modal -->
+{#if showVideoModal}
+  <div class="modal-overlay video-modal-overlay" on:click|self={() => closeVideoModal(true)}>
+    <div class="video-modal-box">
+      <div class="video-modal-title">Video message</div>
+      <!-- svelte-ignore a11y-media-has-caption -->
+      <video
+        class="video-preview"
+        bind:this={videoPreviewEl}
+        autoplay
+        muted
+        playsinline
+      ></video>
+      <div class="video-modal-btns">
+        {#if !videoRecording}
+          <button class="video-rec-btn" on:click={startVideoRec}>● Record</button>
+        {:else}
+          <button class="video-stop-btn" on:click={stopVideoRec}>■ Stop &amp; Send</button>
+        {/if}
+        <button class="modal-cancel" on:click={() => closeVideoModal(true)}>Cancel</button>
+      </div>
+      {#if videoRecording}
+        <div class="video-rec-indicator">● REC</div>
+      {/if}
+    </div>
+  </div>
 {/if}
 
 <style>
@@ -1806,4 +2022,85 @@
   .hist-item { padding: 8px; border-bottom: 1px solid var(--border); }
   .hist-text { display: block; font-size: 12px; color: var(--text); margin-bottom: 2px; }
   .hist-ts { font-size: 10px; color: var(--text-dim); }
+
+  /* ── Mic button ───────────────────────────────────────────────────────────── */
+  .mic-btn {
+    background: none;
+    color: var(--text-dim);
+    font-size: 16px;
+    padding: 0 6px;
+    height: 36px;
+    border-radius: var(--radius);
+    flex-shrink: 0;
+    align-self: flex-end;
+    user-select: none;
+    touch-action: none;
+    transition: color 0.15s, background 0.15s;
+  }
+  .mic-btn:hover:not(:disabled) { background: var(--bg-hover); color: var(--text); }
+  .mic-btn.recording {
+    color: #f38ba8;
+    animation: mic-pulse 1s infinite;
+  }
+  .mic-btn.locked { color: #a6e3a1; animation: none; }
+  @keyframes mic-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.45; }
+  }
+
+  .rec-stop-btn {
+    height: 36px;
+    align-self: flex-end;
+    padding: 0 14px;
+    background: #f38ba8;
+    color: #1e1e2e;
+    border: none;
+    border-radius: var(--radius);
+    font-size: 13px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .rec-stop-btn:hover { filter: brightness(1.1); }
+
+  /* ── Video modal ─────────────────────────────────────────────────────────── */
+  .video-modal-overlay { z-index: 300; }
+  .video-modal-box {
+    background: var(--bg-2, #1e1e2e);
+    border: 1px solid var(--border, #313244);
+    border-radius: 14px;
+    padding: 16px;
+    width: 420px;
+    max-width: 95vw;
+    box-shadow: 0 16px 48px rgba(0,0,0,0.6);
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .video-modal-title { font-size: 14px; font-weight: 600; color: var(--text); }
+  .video-preview {
+    width: 100%;
+    border-radius: 8px;
+    background: #000;
+    aspect-ratio: 4/3;
+    object-fit: cover;
+  }
+  .video-modal-btns { display: flex; gap: 8px; }
+  .video-rec-btn {
+    flex: 1; padding: 8px; font-size: 13px;
+    background: #f38ba8; color: #1e1e2e;
+    border: none; border-radius: 6px; cursor: pointer; font-weight: 600;
+  }
+  .video-rec-btn:hover { filter: brightness(1.1); }
+  .video-stop-btn {
+    flex: 1; padding: 8px; font-size: 13px;
+    background: var(--accent, #89b4fa); color: #1e1e2e;
+    border: none; border-radius: 6px; cursor: pointer; font-weight: 600;
+  }
+  .video-stop-btn:hover { filter: brightness(1.1); }
+  .video-rec-indicator {
+    position: absolute; top: 16px; right: 16px;
+    font-size: 11px; font-weight: 700; color: #f38ba8;
+    animation: mic-pulse 1s infinite;
+  }
 </style>
