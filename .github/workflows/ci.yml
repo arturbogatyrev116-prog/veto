@@ -10,6 +10,7 @@ env:
   RUST_BACKTRACE: 1
   DATABASE_URL: postgres://messenger:secret@localhost/messenger
   NATS_URL: nats://localhost:4222
+  REGISTRATION_OPEN: "1"
 
 jobs:
   test:
