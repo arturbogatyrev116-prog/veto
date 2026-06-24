@@ -143,6 +143,8 @@ async fn alice_to_bob_happy_path() {
         signed_prekey_sig: bob_spk.sign(&bob_identity),
         one_time_prekey: None,
         one_time_prekey_id: None,
+        pq_spk_public: None,
+        pq_spk_sig: None,
     };
 
     let client = common::http_client();
@@ -166,10 +168,10 @@ async fn alice_to_bob_happy_path() {
     let fetched = decode_bundle(&bytes);
 
     let alice_identity = IdentityKeyPair::generate();
-    let (alice_sk, x3dh_header) = x3dh_send(&alice_identity, &fetched).unwrap();
+    let (alice_sk, x3dh_header, pq_ct) = x3dh_send(&alice_identity, &fetched).unwrap();
     let mut alice = RatchetState::init_alice(&alice_sk, fetched.signed_prekey);
 
-    let bob_sk = x3dh_receive(&bob_identity, &bob_spk, None, &x3dh_header).unwrap();
+    let bob_sk = x3dh_receive(&bob_identity, &bob_spk, None, &x3dh_header, pq_ct.as_deref(), None).unwrap();
     let mut bob = RatchetState::init_bob(&bob_sk, StaticSecret::from(bob_spk_bytes));
 
     // Both connect via WebSocket.
@@ -186,7 +188,7 @@ async fn alice_to_bob_happy_path() {
 
     // Alice sends InitEnvelope (first message includes X3DH header).
     let first_msg = alice.encrypt(b"Hello Bob!", ad);
-    let init_env = InitEnvelope { x3dh: x3dh_header, message: first_msg, ad: ad.to_vec() };
+    let init_env = InitEnvelope { x3dh: x3dh_header, message: first_msg, ad: ad.to_vec(), pq_ct };
     alice_ws
         .send(WsMessage::Binary(
             routing_frame(&bob_id, &wire::encode(&init_env).unwrap()).into(),
@@ -285,10 +287,12 @@ async fn replay_attack_rejected() {
         signed_prekey_sig: bob_spk.sign(&bob_identity),
         one_time_prekey: None,
         one_time_prekey_id: None,
+        pq_spk_public: None,
+        pq_spk_sig: None,
     };
 
-    let (alice_sk, header) = x3dh_send(&alice_identity, &bundle).unwrap();
-    let bob_sk = x3dh_receive(&bob_identity, &bob_spk, None, &header).unwrap();
+    let (alice_sk, header, pq_ct) = x3dh_send(&alice_identity, &bundle).unwrap();
+    let bob_sk = x3dh_receive(&bob_identity, &bob_spk, None, &header, pq_ct.as_deref(), None).unwrap();
 
     let mut alice = RatchetState::init_alice(&alice_sk, bundle.signed_prekey);
     let mut bob = RatchetState::init_bob(&bob_sk, StaticSecret::from(bob_spk_bytes));
@@ -322,6 +326,8 @@ async fn concurrent_100_messages() {
         signed_prekey_sig: bob_spk.sign(&bob_identity),
         one_time_prekey: None,
         one_time_prekey_id: None,
+        pq_spk_public: None,
+        pq_spk_sig: None,
     };
 
     let client = common::http_client();
@@ -345,9 +351,9 @@ async fn concurrent_100_messages() {
     );
 
     let alice_identity = IdentityKeyPair::generate();
-    let (alice_sk, x3dh_header) = x3dh_send(&alice_identity, &fetched).unwrap();
+    let (alice_sk, x3dh_header, pq_ct) = x3dh_send(&alice_identity, &fetched).unwrap();
     let mut alice = RatchetState::init_alice(&alice_sk, fetched.signed_prekey);
-    let bob_sk = x3dh_receive(&bob_identity, &bob_spk, None, &x3dh_header).unwrap();
+    let bob_sk = x3dh_receive(&bob_identity, &bob_spk, None, &x3dh_header, pq_ct.as_deref(), None).unwrap();
     let mut bob = RatchetState::init_bob(&bob_sk, StaticSecret::from(bob_spk_bytes));
 
     let (mut alice_ws, _) =
@@ -366,7 +372,7 @@ async fn concurrent_100_messages() {
     let mut expected: Vec<Vec<u8>> = Vec::with_capacity(N);
     let first_pt = b"msg_0".to_vec();
     let first_msg = alice.encrypt(&first_pt, ad);
-    let init_env = InitEnvelope { x3dh: x3dh_header, message: first_msg, ad: ad.to_vec() };
+    let init_env = InitEnvelope { x3dh: x3dh_header, message: first_msg, ad: ad.to_vec(), pq_ct };
     alice_ws
         .send(WsMessage::Binary(
             routing_frame(&bob_id, &wire::encode(&init_env).unwrap()).into(),
