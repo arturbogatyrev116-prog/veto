@@ -32,6 +32,10 @@ messenger_research_2026*.md
 *.ico
 *.icns
 
+# Runtime (server-side only)
+monitor/monitor.log
+monitor/.no_telegram
+
 # OS
 .DS_Store
 Thumbs.db
