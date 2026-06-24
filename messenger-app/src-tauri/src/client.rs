@@ -540,6 +540,7 @@ fn handle_group_broadcast(app: &AppHandle, sender_id: &str, wire_frame: &[u8]) {
         "file_name":    parsed.file_name,
         "file_mime":    parsed.file_mime,
         "file_size":    parsed.file_size,
+        "thumb_data":   parsed.thumb_data,
         "sk":           true,
     })).ok();
 
@@ -1019,6 +1020,7 @@ pub async fn ws_loop(
                                     "file_name": parsed.file_name,
                                     "file_mime": parsed.file_mime,
                                     "file_size": parsed.file_size,
+                                    "thumb_data": parsed.thumb_data,
                                 }))
                                 .ok();
                         } else {
@@ -1035,6 +1037,7 @@ pub async fn ws_loop(
                                     "file_name": parsed.file_name,
                                     "file_mime": parsed.file_mime,
                                     "file_size": parsed.file_size,
+                                    "thumb_data": parsed.thumb_data,
                                 }))
                                 .ok();
                         }

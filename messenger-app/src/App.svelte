@@ -87,7 +87,7 @@
     // Register listeners BEFORE connect() so no events are missed
     const unlistenGroupMsg = await listen('group_message', ({ payload }) => {
       const { gid, from, text, ts, reply_to_ts, reply_to_from, reply_to_text,
-              file_id, file_key, file_name, file_mime, file_size } = payload
+              file_id, file_key, file_name, file_mime, file_size, thumb_data } = payload
       addGroupMessage(gid, {
         from,
         text,
@@ -103,6 +103,7 @@
         file_name: file_name ?? null,
         file_mime: file_mime ?? null,
         file_size: file_size ?? null,
+        thumb_data: thumb_data ?? null,
       })
       let ac; activeConv.subscribe(v => { ac = v })()
       if (ac !== gid) {
@@ -113,7 +114,7 @@
 
     const unlistenMsg = await listen('message', ({ payload }) => {
       const { from, text, ts, reply_to_ts, reply_to_from, reply_to_text,
-              file_id, file_key, file_name, file_mime, file_size } = payload
+              file_id, file_key, file_name, file_mime, file_size, thumb_data } = payload
       addMessage(from, {
         from, text,
         ts: ts ?? Date.now(),
@@ -126,6 +127,7 @@
         file_name: file_name ?? null,
         file_mime: file_mime ?? null,
         file_size: file_size ?? null,
+        thumb_data: thumb_data ?? null,
       })
       activeConv.update(c => c ?? from)
       // Send read receipt if this chat is currently open (debounced)
