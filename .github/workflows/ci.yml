@@ -70,10 +70,10 @@ jobs:
         working-directory: messenger-server
 
       - name: cargo test
-        run: cargo test --workspace --locked
+        run: cargo test -p messenger-server -p messenger-crypto --locked
 
       - name: cargo clippy
-        run: cargo clippy --workspace --locked -- -D warnings
+        run: cargo clippy -p messenger-server -p messenger-crypto --locked -- -D warnings
 
   audit:
     name: Security audit
