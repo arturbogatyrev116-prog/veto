@@ -1,9 +1,11 @@
 <script>
   import { invoke } from '@tauri-apps/api/core'
-  import { conversations, activeConv, user, peerNames, wsStatus, onlinePeers, setPeerName, groups, showSearch, unreadCounts, mutedConvs } from '../stores.js'
+  import { conversations, activeConv, user, peerNames, wsStatus, onlinePeers, setPeerName, groups, showSearch, unreadCounts, mutedConvs, channels } from '../stores.js'
   import Avatar from './Avatar.svelte'
   import DeviceManager from './DeviceManager.svelte'
   import ChatStats from './ChatStats.svelte'
+
+  export let collapsed = false
 
   let newPeerId = ''
   let searchQuery = ''
@@ -116,6 +118,56 @@
   // Expose focus for Ctrl+K and Ctrl+N
   export function focusSearch() { searchEl?.focus() }
   export function focusNewChat() { newChatEl?.focus() }
+
+  // ── Channels ─────────────────────────────────────────────────────────────────
+
+  let channelExpandedGroups = {}   // { [group_id]: boolean }
+  let showNewChannelFor = null     // group_id | null
+  let newChannelName = ''
+  let newChannelDesc = ''
+  let channelError = ''
+  let channelLoading = false
+
+  // Load channels whenever groups change
+  $: {
+    for (const gid of Object.keys($groups)) {
+      if (!$channels[gid]) {
+        invoke('load_channels', { groupId: gid }).then(list => {
+          channels.update(ch => ({ ...ch, [gid]: list }))
+        }).catch(() => {})
+      }
+    }
+  }
+
+  function myRoleIn(gid) {
+    return $groups[gid]?.members.find(m => m.user_id === $user?.user_id)?.role ?? 'member'
+  }
+
+  function canManageChannels(gid) {
+    const r = myRoleIn(gid)
+    return r === 'owner' || r === 'admin'
+  }
+
+  async function createChannel(gid) {
+    const name = newChannelName.trim()
+    if (!name) return
+    channelError = ''; channelLoading = true
+    try {
+      const ch = await invoke('create_channel', { groupId: gid, name, description: newChannelDesc.trim() || null })
+      channels.update(cs => ({ ...cs, [gid]: [...(cs[gid] ?? []), ch] }))
+      newChannelName = ''; newChannelDesc = ''
+      showNewChannelFor = null
+    } catch (e) {
+      channelError = String(e)
+    } finally {
+      channelLoading = false
+    }
+  }
+
+  function openChannel(gid, cid) {
+    conversations.update(c => ({ ...c, [cid]: c[cid] ?? [] }))
+    activeConv.set(`${gid}/${cid}`)
+  }
 
   // ── New group ────────────────────────────────────────────────────────────────
 
@@ -234,7 +286,7 @@
   }
 </script>
 
-<aside>
+<aside class:collapsed>
   <div class="me">
     <div class="me-info">
       <button class="avatar-edit-btn" title="Edit profile" on:click={() => { showProfileEdit = !showProfileEdit; profileDisplayName = $user?.username ?? ''; profileError = '' }}>
@@ -352,6 +404,8 @@
     <ul>
       {#each Object.values($groups) as g}
         {@const unread = $unreadCounts[g.group_id] ?? 0}
+        {@const groupChannels = $channels[g.group_id] ?? []}
+        {@const expanded = channelExpandedGroups[g.group_id] ?? false}
         <li class:active={$activeConv === g.group_id}>
           <button class="conv-btn" on:click={() => { conversations.update(c => ({ ...c, [g.group_id]: c[g.group_id] ?? [] })); activeConv.set(g.group_id) }}>
             <span class="group-icon">#</span>
@@ -361,8 +415,55 @@
             {:else if unread > 0}
               <span class="badge">{unread > 99 ? '99+' : unread}</span>
             {/if}
+            {#if groupChannels.length > 0}
+              <button
+                class="expand-btn"
+                title={expanded ? 'Hide channels' : 'Show channels'}
+                on:click|stopPropagation={() => channelExpandedGroups = { ...channelExpandedGroups, [g.group_id]: !expanded }}
+              >{expanded ? '▾' : '▸'}</button>
+            {/if}
           </button>
         </li>
+
+        {#if expanded && groupChannels.length > 0}
+          <li class="channel-list">
+            {#each groupChannels as ch}
+              {@const chanPeerId = `${g.group_id}/${ch.channel_id}`}
+              <button
+                class="channel-item"
+                class:active={$activeConv === chanPeerId}
+                on:click={() => openChannel(g.group_id, ch.channel_id)}
+                title={ch.description ?? ch.name}
+              >
+                <span class="chan-hash">#</span>
+                <span class="chan-name">{ch.name}</span>
+                {#if !ch.subscribed}<span class="chan-unsub" title="Not subscribed">○</span>{/if}
+              </button>
+            {/each}
+            {#if canManageChannels(g.group_id)}
+              <button
+                class="channel-add-btn"
+                title="Add channel"
+                on:click|stopPropagation={() => { showNewChannelFor = showNewChannelFor === g.group_id ? null : g.group_id; newChannelName = ''; newChannelDesc = ''; channelError = '' }}
+              >+ channel</button>
+            {/if}
+          </li>
+        {/if}
+
+        {#if showNewChannelFor === g.group_id}
+          <li class="channel-form-li">
+            <form class="channel-form" on:submit|preventDefault={() => createChannel(g.group_id)}>
+              <input type="text" bind:value={newChannelName} placeholder="channel-name" disabled={channelLoading} maxlength="50" />
+              <input type="text" bind:value={newChannelDesc} placeholder="Description (optional)" disabled={channelLoading} maxlength="200" />
+              <div class="channel-form-btns">
+                <button type="submit" disabled={channelLoading || !newChannelName.trim()}>Create</button>
+                <button type="button" on:click={() => { showNewChannelFor = null; channelError = '' }}>✕</button>
+              </div>
+              {#if channelError}<p class="err">{channelError}</p>{/if}
+            </form>
+          </li>
+        {/if}
+
       {/each}
     </ul>
   {:else}
@@ -565,6 +666,42 @@
   .group-form-btns { display: flex; gap: 5px; }
   .group-form-btns button { flex: 1; font-size: 12px; padding: 5px; }
 
+  /* ── Channels ─── */
+  .expand-btn {
+    background: none; border: none; color: var(--text-dim);
+    padding: 0 2px; font-size: 10px; flex-shrink: 0; cursor: pointer;
+    line-height: 1;
+  }
+  .channel-list {
+    list-style: none; padding: 0 0 2px 20px;
+    border-bottom: 1px solid var(--border-sub);
+  }
+  .channel-item {
+    display: flex; align-items: center; gap: 4px; width: 100%;
+    padding: 4px 8px; font-size: 12px; color: var(--text-muted);
+    background: none; text-align: left; border-radius: 4px; cursor: pointer;
+  }
+  .channel-item:hover { background: var(--bg-hover); color: var(--text); }
+  .channel-item.active { background: var(--bg-active); color: var(--text); font-weight: 600; }
+  .chan-hash { color: var(--text-dim); font-size: 11px; flex-shrink: 0; }
+  .chan-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chan-unsub { font-size: 10px; color: var(--text-dim); flex-shrink: 0; }
+  .channel-add-btn {
+    display: block; width: 100%; padding: 3px 8px;
+    font-size: 11px; color: var(--text-dim); background: none; text-align: left;
+    border-radius: 4px; cursor: pointer;
+  }
+  .channel-add-btn:hover { background: var(--bg-hover); color: var(--accent); }
+  .channel-form-li { list-style: none; }
+  .channel-form {
+    padding: 5px 10px 7px;
+    display: flex; flex-direction: column; gap: 4px;
+    border-bottom: 1px solid var(--border);
+  }
+  .channel-form input { font-size: 12px; padding: 4px 7px; }
+  .channel-form-btns { display: flex; gap: 4px; }
+  .channel-form-btns button { flex: 1; font-size: 11px; padding: 4px; }
+
   .backup-row {
     display: flex;
     justify-content: center;
@@ -590,13 +727,24 @@
   }
   .backup-err { color: var(--danger); font-size: 11px; padding: 0 10px 6px; }
 
-  /* Narrow window — collapse sidebar to icons */
-  @media (max-width: 500px) {
-    aside { width: 56px; }
-    .username, .peer-name, .count, .search-wrap, .new-chat, .ws-dot { display: none; }
-    .me { justify-content: center; }
-    li { justify-content: center; padding: 10px 0; }
-  }
+  /* Icons-only collapsed mode (controlled by parent Chat.svelte) */
+  aside.collapsed { width: 56px; }
+  aside.collapsed .username,
+  aside.collapsed .peer-name,
+  aside.collapsed .count,
+  aside.collapsed .search-wrap,
+  aside.collapsed .new-chat,
+  aside.collapsed .ws-dot,
+  aside.collapsed .section-header,
+  aside.collapsed .saved-row span,
+  aside.collapsed .backup-row :not(:first-child),
+  aside.collapsed .group-form,
+  aside.collapsed .dnd-panel { display: none; }
+  aside.collapsed .me { justify-content: center; }
+  aside.collapsed .me-actions { gap: 2px; }
+  aside.collapsed li { justify-content: center; padding: 10px 0; }
+  aside.collapsed .conv-btn { justify-content: center; padding: 10px 0; }
+  aside.collapsed .backup-row { flex-direction: column; gap: 6px; }
 
   /* ── DND panel ───────────────────────────────────────────────────────────── */
   .protected-on { color: var(--accent) !important; }

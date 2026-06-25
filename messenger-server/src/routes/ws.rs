@@ -23,6 +23,11 @@ pub const GROUP_MAGIC: &[u8] = &[0xCA, 0xFE, 0x04, 0x00];
 /// Server routes the same way as GROUP_MAGIC (fan-out to all group members).
 pub const GROUP_READ_MAGIC: &[u8] = &[0xCA, 0xFE, 0x05, 0x00];
 
+/// Client → server channel broadcast frame.
+/// Format: [CHANNEL_MAGIC: 4B][4B gid_len][gid][4B cid_len][cid][payload]
+/// Server fans out only to channel subscribers (not all group members).
+pub const CHANNEL_MAGIC: &[u8] = &[0xCA, 0xFE, 0x0A, 0x00];
+
 /// Server → client notification that a group member has left.
 /// Format: [GROUP_MEMBER_LEFT_MAGIC: 4B][u32_BE gid_len][gid UTF-8][u32_BE uid_len][leaver_uid UTF-8]
 pub const GROUP_MEMBER_LEFT_MAGIC: &[u8] = &[0xCA, 0xFE, 0x06, 0x00];
@@ -138,7 +143,9 @@ async fn handle(socket: WebSocket, user_id: String, state: AppState) {
         };
         match msg {
             Message::Binary(data) => {
-                if data.len() >= 4 && (&data[..4] == GROUP_MAGIC || &data[..4] == GROUP_READ_MAGIC) {
+                if data.len() >= 4 && &data[..4] == CHANNEL_MAGIC {
+                    route_channel_message(&state, &data, &user_id).await;
+                } else if data.len() >= 4 && (&data[..4] == GROUP_MAGIC || &data[..4] == GROUP_READ_MAGIC) {
                     route_group_message(&state, &data, &user_id).await;
                 } else {
                     route_message(&state, &data, &user_id);
@@ -220,6 +227,63 @@ async fn route_group_message(state: &AppState, frame: &[u8], sender_id: &str) {
         }
     }
     tracing::info!(gid, sender_id, members = members.len(), "group broadcast");
+}
+
+/// Handle `[CHANNEL_MAGIC][4B gid_len][gid][4B cid_len][cid][payload]` frames.
+/// Fetches channel subscribers from DB and broadcasts only to them.
+async fn route_channel_message(state: &AppState, frame: &[u8], sender_id: &str) {
+    let after_magic = &frame[4..];
+    let Some((gid, rest)) = parse_u32_len_prefix(after_magic) else {
+        tracing::warn!("channel frame: malformed gid");
+        return;
+    };
+    let Some((cid_str, _)) = parse_u32_len_prefix(rest) else {
+        tracing::warn!("channel frame: malformed cid");
+        return;
+    };
+    let cid_uuid = match uuid::Uuid::parse_str(cid_str) {
+        Ok(u) => u,
+        Err(_) => { tracing::warn!("channel frame: cid not a UUID"); return; }
+    };
+
+    // Fetch channel subscribers.
+    let subscriber_ids = match crate::routes::channels::get_subscriber_ids(state, cid_uuid).await {
+        Ok(ids) => ids,
+        Err(e) => { tracing::warn!("channel frame: failed to fetch subscribers: {e:?}"); return; }
+    };
+    if subscriber_ids.is_empty() {
+        tracing::warn!(cid = cid_str, "channel frame: no subscribers");
+        return;
+    }
+
+    // Build outgoing frame (same as group broadcast — sender prepended).
+    let sid = sender_id.as_bytes();
+    let mut payload = Vec::with_capacity(4 + sid.len() + frame.len());
+    payload.extend_from_slice(&(sid.len() as u32).to_be_bytes());
+    payload.extend_from_slice(sid);
+    payload.extend_from_slice(frame);
+
+    for member_id in &subscriber_ids {
+        if member_id == sender_id { continue; }
+        if let Some(tx) = state.inner.sessions.get(member_id) {
+            if tx.send(Message::Binary(payload.clone().into())).is_err() {
+                drop(tx);
+                enqueue_offline(state, member_id, payload.clone());
+            }
+        } else {
+            enqueue_offline(state, member_id, payload.clone());
+        }
+    }
+    tracing::info!(gid, cid = cid_str, sender_id, subs = subscriber_ids.len(), "channel broadcast");
+}
+
+/// Parse `[4B BE len][str bytes][rest]` — helper shared by channel/group routing.
+fn parse_u32_len_prefix(data: &[u8]) -> Option<(&str, &[u8])> {
+    if data.len() < 4 { return None; }
+    let len = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
+    if data.len() < 4 + len { return None; }
+    let s = std::str::from_utf8(&data[4..4 + len]).ok()?;
+    Some((s, &data[4 + len..]))
 }
 
 fn route_message(state: &AppState, frame: &[u8], sender_id: &str) {

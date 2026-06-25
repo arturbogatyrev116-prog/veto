@@ -4,13 +4,21 @@
   import { tick, onMount, onDestroy } from 'svelte'
   import { marked } from 'marked'
   import hljs from 'highlight.js'
-  import { conversations, activeConv, user, peerNames, typingPeers, addMessage, addGroupMessage, removeMessage, onlinePeers, unlocked, groups, unreadCounts, reactions } from '../stores.js'
+  import { conversations, activeConv, user, peerNames, typingPeers, addMessage, addGroupMessage, removeMessage, onlinePeers, unlocked, groups, unreadCounts, reactions, showSearch, channels } from '../stores.js'
   import Avatar from './Avatar.svelte'
   import SafetyNumbers from './SafetyNumbers.svelte'
   import AudioPlayer from './AudioPlayer.svelte'
   import VideoPlayer from './VideoPlayer.svelte'
+  import PollView from './PollView.svelte'
+  import SlashCommandPalette from './SlashCommandPalette.svelte'
+  import StickerPicker from './StickerPicker.svelte'
+  import GroupEventModal from './GroupEventModal.svelte'
+  import LinkPreviewCard from './LinkPreviewCard.svelte'
 
   export let peerId
+  export let onToggleSidebar = null
+  export let onToggleDetail = null
+  export let detailOpen = false
 
   let text = ''
   let error = ''
@@ -167,6 +175,57 @@
   })
   onDestroy(() => { unlistenGrpRead?.() })
 
+  // ── Polls ──────────────────────────────────────────────────────────────────
+
+  let showPollModal = false
+  let pollQuestion = ''
+  let pollOptions = ['', '']
+  let creatingPoll = false
+
+  function parsePollId(text) {
+    const m = text?.match(/^\[poll:([0-9a-f-]{36})\]$/)
+    return m ? m[1] : null
+  }
+
+  function addPollOption() {
+    if (pollOptions.length < 10) pollOptions = [...pollOptions, '']
+  }
+  function removePollOption(i) {
+    if (pollOptions.length > 2) pollOptions = pollOptions.filter((_, idx) => idx !== i)
+  }
+
+  async function createAndSendPoll() {
+    const q = pollQuestion.trim()
+    const opts = pollOptions.map(o => o.trim()).filter(Boolean)
+    if (!q || opts.length < 2) return
+    creatingPoll = true
+    try {
+      const pollId = await invoke('create_poll', { peerId, question: q, options: opts })
+      const markerText = `[poll:${pollId}]`
+      if (isGroup) {
+        await invoke('send_group_message', { groupId: peerId, text: markerText })
+        addGroupMessage(peerId, {
+          from: $user.user_id, text: markerText, ts: Date.now(), status: 'sent',
+          group_id: peerId, sender_id: $user.user_id,
+          reply_to_ts: null, reply_to_from: null, reply_to_text: null,
+          file_id: null, file_key: null, file_name: null, file_mime: null, file_size: null, thumb_data: null,
+        })
+      } else {
+        const { id } = await invoke('send_message', { peerId, text: markerText })
+        addMessage(peerId, {
+          from: $user.user_id, text: markerText, ts: Date.now(), id, status: 'sent',
+          reply_to_ts: null, reply_to_from: null, reply_to_text: null,
+          file_id: null, file_key: null, file_name: null, file_mime: null, file_size: null, thumb_data: null,
+        })
+      }
+      showPollModal = false
+      pollQuestion = ''
+      pollOptions = ['', '']
+      await tick(); scrollBottom()
+    } catch (e) { error = String(e) }
+    creatingPoll = false
+  }
+
   // ── Chat export ────────────────────────────────────────────────────────────
 
   let showExport = false
@@ -272,43 +331,53 @@
 
   $: if (peerId && $unlocked && !loadedPeers.has(peerId)) {
     loadedPeers.add(peerId)
-    const isGrp = !!$groups[peerId]
+    const _isGrp = !isChannel && !!$groups[peerId]
+    const _convKey = convKey
+    const _chanId = channelId
     // Fetch last-read timestamp in parallel with history load
-    invoke('get_last_read_ts', { peerId }).then(ts => {
-      lastReadByPeer = { ...lastReadByPeer, [peerId]: ts }
+    invoke('get_last_read_ts', { peerId: _convKey }).then(ts => {
+      lastReadByPeer = { ...lastReadByPeer, [_convKey]: ts }
     }).catch(() => {})
-    // Load per-member read marks for group chats
-    if (isGrp) {
+    // Load per-member read marks for group chats (not channels)
+    if (_isGrp) {
       invoke('get_group_read_marks', { groupId: peerId })
         .then(marks => { groupReadMarks = marks })
         .catch(() => {})
     }
-    const loadPromise = isGrp
-      ? invoke('get_group_messages', { groupId: peerId, limit: PAGE_SIZE, beforeId: null })
-      : invoke('get_messages', { peerId, limit: PAGE_SIZE, beforeId: null })
+    const loadPromise = isChannel
+      ? invoke('get_group_messages', { groupId: _chanId, limit: PAGE_SIZE, beforeId: null })
+      : (_isGrp
+        ? invoke('get_group_messages', { groupId: peerId, limit: PAGE_SIZE, beforeId: null })
+        : invoke('get_messages', { peerId, limit: PAGE_SIZE, beforeId: null }))
     loadPromise.then(history => {
-      conversations.update(c => ({ ...c, [peerId]: history }))
+      conversations.update(c => ({ ...c, [_convKey]: history }))
       peerMeta[peerId] = {
         oldestDbId: history.length > 0 ? history[0].db_id : null,
         hasMore: history.length === PAGE_SIZE,
       }
-      if (!isGrp && history.some(m => m.from === peerId)) {
+      if (!_isGrp && !isChannel && history.some(m => m.from === peerId)) {
         invoke('send_read_receipt', { peerId }).catch(() => {})
       }
     }).catch(() => {})
+    // Load pending scheduled messages for this conversation.
+    invoke('list_scheduled', { peerId: _convKey }).then(l => { scheduledMsgs = l }).catch(() => {})
+    // Load retention setting.
+    invoke('get_retention', { peerId: _convKey }).then(c => { retentionCount = c }).catch(() => {})
   }
 
   // When switching to a conversation, schedule mark-as-read after 1 s
   $: if (peerId) {
     clearTimeout(readTimers[peerId])
+    const _ck = convKey
+    const _isGrp2 = isGroup
     readTimers[peerId] = setTimeout(() => {
-      const msgs = $conversations[peerId] ?? []
+      const msgs = $conversations[_ck] ?? []
       const maxTs = msgs.reduce((acc, m) => m.ts > acc ? m.ts : acc, 0)
       if (maxTs > 0) {
-        invoke('mark_as_read', { peerId, ts: maxTs }).catch(() => {})
-        lastReadByPeer = { ...lastReadByPeer, [peerId]: maxTs }
-        unreadCounts.update(c => { const n = { ...c }; delete n[peerId]; return n })
-        if (!!$groups[peerId]) {
+        invoke('mark_as_read', { peerId: _ck, ts: maxTs }).catch(() => {})
+        lastReadByPeer = { ...lastReadByPeer, [_ck]: maxTs }
+        unreadCounts.update(c => { const n = { ...c }; delete n[_ck]; return n })
+        if (_isGrp2) {
           invoke('send_group_read_receipt', { groupId: peerId, ts: maxTs }).catch(() => {})
         }
       }
@@ -404,8 +473,8 @@
 
   // Compute the index of the first unread received message (for divider placement)
   $: firstUnreadIdx = (() => {
-    const msgs = $conversations[peerId] ?? []
-    const lr = lastReadByPeer[peerId] ?? 0
+    const msgs = $conversations[convKey] ?? []
+    const lr = lastReadByPeer[convKey] ?? 0
     if (lr === 0) return -1  // no read state — no divider
     for (let i = 0; i < msgs.length; i++) {
       if (msgs[i].ts > lr && msgs[i].from !== ($user?.user_id ?? '')) return i
@@ -420,12 +489,14 @@
     const prevScrollTop  = messagesEl?.scrollTop  ?? 0
     loadingMore = true
     try {
-      const more = await (isGroup
+      const more = await (isChannel
+        ? invoke('get_group_messages', { groupId: channelId, limit: PAGE_SIZE, beforeId: meta.oldestDbId })
+        : isGroup
         ? invoke('get_group_messages', { groupId: peerId, limit: PAGE_SIZE, beforeId: meta.oldestDbId })
         : invoke('get_messages', { peerId, limit: PAGE_SIZE, beforeId: meta.oldestDbId }))
       if (more.length > 0) {
         peerMeta[peerId] = { oldestDbId: more[0].db_id, hasMore: more.length === PAGE_SIZE }
-        conversations.update(c => ({ ...c, [peerId]: [...more, ...(c[peerId] ?? [])] }))
+        conversations.update(c => ({ ...c, [convKey]: [...more, ...(c[convKey] ?? [])] }))
         await tick()
         // Restore visual scroll position after prepending older messages.
         if (messagesEl) {
@@ -470,20 +541,12 @@
       await invoke('pin_message', { peerId, msgTs: m.ts, msgFrom: m.from, msgText: m.text ?? '' })
       pinnedMsgs = [...pinnedMsgs, { msg_ts: m.ts, msg_from: m.from, msg_text: m.text ?? '', pinned_at: Date.now() }]
     }
-    ctxVisible = false
   }
 
   function scrollToPinned(pin) {
     const el = messagesEl?.querySelector(`[data-ts="${pin.msg_ts}"]`)
     if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); showPinnedList = false }
   }
-
-  // Context menu state
-  let ctxVisible = false
-  let ctxX = 0, ctxY = 0
-  let ctxText = ''
-  let ctxMsg = null
-  let ctxMine = false
 
   const renderer = new marked.Renderer()
   renderer.code = ({ text, lang }) => {
@@ -497,12 +560,105 @@
     return marked.parse(raw ?? '')
   }
 
-  $: messages = $conversations[peerId] ?? []
-  $: peerName = $peerNames[peerId] ?? peerId.slice(0, 8) + '…'
-  $: isTyping = !!$typingPeers[peerId]
-  $: isGroup = !!$groups[peerId]
   $: isSaved = peerId === '__saved__'
+  $: isChannel = typeof peerId === 'string' && peerId.includes('/') && !isSaved
+  $: channelGroupId = isChannel ? peerId.split('/')[0] : null
+  $: channelId = isChannel ? peerId.split('/')[1] : null
+  $: channelInfo = isChannel ? ($channels[channelGroupId] ?? []).find(c => c.channel_id === channelId) : null
+  $: channelGroupInfo = isChannel ? $groups[channelGroupId] : null
+  $: convKey = isChannel ? channelId : peerId
+
+  $: messages = $conversations[convKey] ?? []
+  $: peerName = $peerNames[peerId] ?? peerId?.slice(0, 8) + '…'
+  $: isTyping = !!$typingPeers[peerId]
+  $: isGroup = !isChannel && !!$groups[peerId]
   $: groupInfo = $groups[peerId] ?? null
+
+  // ── Sticker picker ────────────────────────────────────────────────────────────
+  let showStickerPicker = false
+
+  // ── Event modal ───────────────────────────────────────────────────────────────
+  let showEventModal = false
+
+  // ── C6 Message Scheduling ─────────────────────────────────────────────────────
+  let showScheduleModal = false
+  let scheduleDatetime = ''
+  let scheduledMsgs = []
+  let showScheduledList = false
+
+  // ── C15 Data Retention ────────────────────────────────────────────────────────
+  let retentionCount = 0
+  let showRetentionMenu = false
+  const RETENTION_OPTIONS = [
+    { label: 'Unlimited', value: 0 },
+    { label: 'Last 500', value: 500 },
+    { label: 'Last 1,000', value: 1000 },
+    { label: 'Last 2,000', value: 2000 },
+    { label: 'Last 5,000', value: 5000 },
+  ]
+
+  async function setRetention(count) {
+    retentionCount = count
+    showRetentionMenu = false
+    try {
+      await invoke('set_retention', { peerId: convKey, retentionCount: count })
+      if (count > 0) {
+        const q = isChannel
+          ? invoke('get_group_messages', { groupId: channelId, limit: PAGE_SIZE, beforeId: null })
+          : isGroup
+            ? invoke('get_group_messages', { groupId: peerId, limit: PAGE_SIZE, beforeId: null })
+            : invoke('get_messages', { peerId, limit: PAGE_SIZE, beforeId: null })
+        const updated = await q.catch(() => null)
+        if (updated) conversations.update(c => ({ ...c, [convKey]: updated }))
+      }
+    } catch (e) { error = String(e) }
+  }
+
+  // ── C3 Link Preview ───────────────────────────────────────────────────────────
+  const URL_REGEX = /https?:\/\/[^\s<>"']+/g
+  let linkPreviews = {}       // msgKey → LinkPreview | null | 'loading'
+  let previewQueue = []
+  let isFetchingPreviews = false
+
+  function extractFirstUrl(text) {
+    const m = text?.match(URL_REGEX)
+    return m ? m[0] : null
+  }
+
+  async function processPreviewQueue() {
+    if (isFetchingPreviews) return
+    isFetchingPreviews = true
+    while (previewQueue.length > 0) {
+      const { msgKey, url } = previewQueue.shift()
+      if (linkPreviews[msgKey] !== undefined && linkPreviews[msgKey] !== 'loading') continue
+      const p = await invoke('fetch_link_preview', { url }).catch(() => null)
+      linkPreviews = { ...linkPreviews, [msgKey]: p ?? null }
+      if (previewQueue.length > 0) await new Promise(r => setTimeout(r, 80))
+    }
+    isFetchingPreviews = false
+  }
+
+  $: {
+    for (const m of messages) {
+      if (!m.sticker && !m.location && !m.event_data && m.text) {
+        const key = `${m.ts}_${m.from}`
+        if (linkPreviews[key] === undefined) {
+          const url = extractFirstUrl(m.text)
+          if (url) {
+            linkPreviews[key] = 'loading'
+            previewQueue.push({ msgKey: key, url })
+            processPreviewQueue()
+          } else {
+            linkPreviews[key] = null
+          }
+        }
+      }
+    }
+  }
+
+  // ── Translations ──────────────────────────────────────────────────────────────
+  let translations = {}
+  let translating = {}
 
   // Whether this group uses Sender Keys (O(1) encryption)
   let groupUseSK = false
@@ -677,9 +833,26 @@
           reply_to_ts: null, reply_to_from: null, reply_to_text: null,
           file_id: null, file_key: null, file_name: null, file_mime: null, file_size: null,
         })
+      } else if (isChannel) {
+        const mentionIds = mentions.map(m => m.id)
+        await invoke('send_channel_message', { channelId, groupId: channelGroupId, text: msg, replyTo: replyArg, mentions: mentionIds, payloadOverride: null })
+        addGroupMessage(channelId, {
+          from: $user.user_id,
+          text: msg,
+          ts: Date.now(),
+          status: 'sent',
+          group_id: channelId,
+          sender_id: $user.user_id,
+          reply_to_ts:   replyTo?.ts   ?? null,
+          reply_to_from: replyTo?.from ?? null,
+          reply_to_text: replyTo?.text ?? null,
+          file_id: null, file_key: null, file_name: null, file_mime: null, file_size: null,
+          mentions: mentionIds,
+        })
       } else if (isGroup) {
-        await invoke('send_group_message', { groupId: peerId, text: msg, replyTo: replyArg })
-        addMessage(peerId, {
+        const mentionIds = mentions.map(m => m.id)
+        await invoke('send_group_message', { groupId: peerId, text: msg, replyTo: replyArg, mentions: mentionIds })
+        addGroupMessage(peerId, {
           from: $user.user_id,
           text: msg,
           ts: Date.now(),
@@ -690,9 +863,11 @@
           reply_to_from: replyTo?.from ?? null,
           reply_to_text: replyTo?.text ?? null,
           file_id: null, file_key: null, file_name: null, file_mime: null, file_size: null,
+          mentions: mentionIds,
         })
       } else {
-        const { id, ts: msgTs } = await invoke('send_message', { peerId, text: msg, replyTo: replyArg })
+        const mentionIds = mentions.map(m => m.id)
+        const { id, ts: msgTs } = await invoke('send_message', { peerId, text: msg, replyTo: replyArg, mentions: mentionIds })
         addMessage(peerId, {
           from: $user.user_id,
           text: msg,
@@ -703,10 +878,12 @@
           reply_to_from: replyTo?.from ?? null,
           reply_to_text: replyTo?.text ?? null,
           file_id: null, file_key: null, file_name: null, file_mime: null, file_size: null,
+          mentions: mentionIds,
         })
       }
       text = ''
       replyTo = null
+      mentions = []
       saveDraft(peerId, '')
       await tick()
       scrollBottom()
@@ -718,11 +895,226 @@
     }
   }
 
+  // ── Sticker send ──────────────────────────────────────────────────────────────
+
+  async function sendSticker(sticker) {
+    showStickerPicker = false
+    const payload = JSON.stringify({ sticker: { pack: sticker.pack, id: sticker.id } })
+    const ts = Date.now()
+    try {
+      if (isChannel) {
+        await invoke('send_channel_message', { channelId, groupId: channelGroupId, text: '', payloadOverride: payload })
+        addGroupMessage(channelId, { from: $user.user_id, text: '', ts, status: 'sent', group_id: channelId, sender_id: $user.user_id, sticker: sticker, reply_to_ts: null, reply_to_from: null, reply_to_text: null, file_id: null, file_key: null, file_name: null, file_mime: null, file_size: null })
+      } else if (isGroup) {
+        await invoke('send_group_message', { groupId: peerId, text: '', payloadOverride: payload })
+        addGroupMessage(peerId, { from: $user.user_id, text: '', ts, status: 'sent', group_id: peerId, sender_id: $user.user_id, sticker: sticker, reply_to_ts: null, reply_to_from: null, reply_to_text: null, file_id: null, file_key: null, file_name: null, file_mime: null, file_size: null })
+      }
+      await tick(); scrollBottom()
+    } catch (e) { error = String(e) }
+  }
+
+  // ── Location send ─────────────────────────────────────────────────────────────
+
+  async function sendLocation() {
+    if (!navigator.geolocation) { error = 'Geolocation not available'; return }
+    let pos
+    try {
+      pos = await new Promise((res, rej) => navigator.geolocation.getCurrentPosition(res, rej, { timeout: 10_000 }))
+    } catch (e) {
+      error = 'Location denied or unavailable'; return
+    }
+    const { latitude: lat, longitude: lng, accuracy: acc } = pos.coords
+    if (!confirm(`Share your location? (±${Math.round(acc)}m accuracy)`)) return
+    const payload = JSON.stringify({ location: { lat, lng, acc: Math.round(acc) } })
+    const ts = Date.now()
+    const locObj = { lat, lng, acc: Math.round(acc) }
+    try {
+      if (isChannel) {
+        await invoke('send_channel_message', { channelId, groupId: channelGroupId, text: '', payloadOverride: payload })
+        addGroupMessage(channelId, { from: $user.user_id, text: '', ts, status: 'sent', group_id: channelId, sender_id: $user.user_id, location: locObj, reply_to_ts: null, reply_to_from: null, reply_to_text: null, file_id: null, file_key: null, file_name: null, file_mime: null, file_size: null })
+      } else if (isGroup) {
+        await invoke('send_group_message', { groupId: peerId, text: '', payloadOverride: payload })
+        addGroupMessage(peerId, { from: $user.user_id, text: '', ts, status: 'sent', group_id: peerId, sender_id: $user.user_id, location: locObj, reply_to_ts: null, reply_to_from: null, reply_to_text: null, file_id: null, file_key: null, file_name: null, file_mime: null, file_size: null })
+      }
+      await tick(); scrollBottom()
+    } catch (e) { error = String(e) }
+  }
+
+  // ── Translation ───────────────────────────────────────────────────────────────
+
+  async function translateMsg(m) {
+    const key = `${m.ts}_${m.from}`
+    if (translations[key]) {
+      const t = { ...translations }; delete t[key]; translations = t
+      return
+    }
+    translating = { ...translating, [key]: true }
+    try {
+      const lang = (navigator.language ?? 'en').split('-')[0]
+      const result = await invoke('translate_message', { text: m.text ?? '', targetLang: lang })
+      translations = { ...translations, [key]: result }
+    } catch (e) {
+      error = String(e)
+    } finally {
+      translating = { ...translating, [key]: false }
+    }
+  }
+
+  // ── RSVP ─────────────────────────────────────────────────────────────────────
+
+  async function sendRsvp(eventTs, status) {
+    const gid = isChannel ? channelGroupId : peerId
+    try {
+      await invoke('send_rsvp', { groupId: gid, eventTs, status })
+    } catch (e) { error = String(e) }
+  }
+
+  // ── C6 Scheduling helpers ─────────────────────────────────────────────────────
+
+  async function scheduleMessage() {
+    if (!scheduleDatetime || !text.trim()) return
+    const sendAtMs = new Date(scheduleDatetime).getTime()
+    if (sendAtMs <= Date.now()) { error = 'Please pick a future time'; return }
+    try {
+      await invoke('schedule_message', {
+        peerId: convKey,
+        text: text.trim(),
+        sendAtMs,
+        isGroup: isGroup || isChannel,
+        isChannel,
+        channelGroupId: isChannel ? channelGroupId : null,
+        replyTo: replyTo ? { ts: replyTo.ts, from: replyTo.from, text: replyTo.text } : null,
+        mentions: mentions.length ? mentions : null,
+      })
+      text = ''
+      replyTo = null
+      mentions = []
+      scheduleDatetime = ''
+      showScheduleModal = false
+      scheduledMsgs = await invoke('list_scheduled', { peerId: convKey }).catch(() => [])
+    } catch (e) { error = String(e) }
+  }
+
+  async function cancelScheduled(id) {
+    scheduledMsgs = scheduledMsgs.filter(s => s.id !== id)
+    await invoke('cancel_scheduled', { id }).catch(() => {})
+    scheduledMsgs = await invoke('list_scheduled', { peerId: convKey }).catch(() => [])
+  }
+
+  function fmtScheduledTime(ms) {
+    const d = new Date(ms)
+    return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' +
+           d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  }
+
+  // ── Slash commands ────────────────────────────────────────────────────────────
+
+  let showSlashPalette = false
+  let slashQuery = ''
+  let slashPaletteRef
+
+  async function executeSlashCommand(cmd) {
+    showSlashPalette = false
+    text = ''
+    switch (cmd.cmd) {
+      case 'clear':
+        if (confirm('Delete all local messages? This cannot be undone.')) {
+          await invoke('delete_message', { peerId, ts: 0, from: '', deleteAll: true }).catch(() => {})
+          conversations.update(c => ({ ...c, [peerId]: [] }))
+        }
+        break
+      case 'mute':
+        showMuteMenu = true
+        break
+      case 'ttl':
+        showTtlMenu = true
+        break
+      case 'export':
+        showExport = true
+        break
+      case 'search':
+        showSearch.set(true)
+        break
+      case 'poll':
+        showPollModal = true
+        break
+      case 'schedule':
+        showScheduleModal = true
+        break
+    }
+    await tick()
+    textareaEl?.focus()
+  }
+
   function onKeydown(e) {
+    if (showSlashPalette) {
+      if (e.key === 'Escape') { showSlashPalette = false; return }
+      if (e.key === 'ArrowDown') { e.preventDefault(); slashPaletteRef?.moveDown(); return }
+      if (e.key === 'ArrowUp') { e.preventDefault(); slashPaletteRef?.moveUp(); return }
+      if (e.key === 'Enter') { e.preventDefault(); slashPaletteRef?.confirm(); return }
+    }
+    if (showMentionPicker && (e.key === 'Escape' || e.key === 'ArrowDown')) {
+      if (e.key === 'Escape') { showMentionPicker = false; return }
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
+      if (showMentionPicker && mentionCandidates.length > 0) {
+        selectMention(mentionCandidates[0])
+        return
+      }
       send()
     }
+  }
+
+  // ── @mention autocomplete ──────────────────────────────────────────────────
+
+  let mentions = []             // { id: string, name: string }[] for the current message
+  let showMentionPicker = false
+  let mentionSearch = ''
+
+  $: memberList = isGroup
+    ? ($groups[peerId]?.members ?? []).filter(m => m.user_id !== $user?.user_id)
+    : []
+  $: mentionCandidates = showMentionPicker
+    ? memberList.filter(m => m.username.toLowerCase().includes(mentionSearch.toLowerCase()))
+    : []
+
+  function selectMention(member) {
+    if (!textareaEl) return
+    const cursor = textareaEl.selectionStart
+    const before = text.slice(0, cursor)
+    const after = text.slice(cursor)
+    const match = before.match(/@(\w*)$/)
+    if (match) {
+      text = before.slice(0, -match[0].length) + '@' + member.username + ' ' + after
+      if (!mentions.some(m => m.id === member.user_id)) {
+        mentions = [...mentions, { id: member.user_id, name: member.username }]
+      }
+    }
+    showMentionPicker = false
+    tick().then(() => textareaEl?.focus())
+  }
+
+  function renderText(m) {
+    const raw = m.text ?? ''
+    if (!raw) return ''
+    if (!m.mentions?.length) return renderMd(raw)
+    const mentionedIds = new Set(m.mentions)
+    const members = $groups[peerId]?.members ?? []
+    const mentionNames = {}
+    for (const mb of members) {
+      if (mentionedIds.has(mb.user_id)) {
+        mentionNames[mb.username] = mb.user_id === $user?.user_id
+      }
+    }
+    if (!Object.keys(mentionNames).length) return renderMd(raw)
+    const processed = raw.replace(/@(\w+)/g, (match, name) => {
+      if (name in mentionNames) {
+        return `<mark class="mention${mentionNames[name] ? ' mention-mine' : ''}">${match}</mark>`
+      }
+      return match
+    })
+    return renderMd(processed)
   }
 
   // ── Typing indicator ───────────────────────────────────────────────────────
@@ -731,6 +1123,24 @@
 
   function onInput() {
     scheduleDraftSave(peerId, text)
+    // Slash command palette: '/' at position 0 in otherwise empty textarea
+    if (text.startsWith('/') && !text.includes(' ') && !text.includes('\n')) {
+      slashQuery = text.slice(1)
+      showSlashPalette = true
+    } else {
+      showSlashPalette = false
+    }
+    // @mention autocomplete (groups only)
+    if (isGroup && textareaEl) {
+      const cursor = textareaEl.selectionStart
+      const atMatch = text.slice(0, cursor).match(/@(\w*)$/)
+      if (atMatch) {
+        mentionSearch = atMatch[1]
+        showMentionPicker = true
+      } else {
+        showMentionPicker = false
+      }
+    }
     if (isGroup) return  // Typing indicators are DM-only
     if (typingTimer) return
     invoke('send_typing', { peerId }).catch(() => {})
@@ -936,59 +1346,97 @@
     return { destroy() { node.removeEventListener('input', resize) } }
   }
 
-  // ── Context menu ───────────────────────────────────────────────────────────
+  // ── Native context menu ────────────────────────────────────────────────────
 
-  function showCtx(e, m, mine) {
-    e.preventDefault()
-    ctxText = m.text
-    ctxMsg  = m
-    ctxMine = mine
-    ctxX = e.clientX
-    ctxY = e.clientY
-    ctxVisible = true
+  // ── Channel message event ─────────────────────────────────────────────────────
+  let unlistenChanMsg
+  onMount(async () => {
+    unlistenChanMsg = await listen('channel_message', ({ payload }) => {
+      const { gid, cid, from, text: t, ts, sticker, location: loc, event_data, rsvp } = payload
+      addGroupMessage(cid, {
+        from, text: t ?? '', ts, status: 'received',
+        group_id: cid, sender_id: from,
+        sticker: sticker ?? null,
+        location: loc ?? null,
+        event_data: event_data ?? null,
+        rsvp: rsvp ?? null,
+        reply_to_ts: null, reply_to_from: null, reply_to_text: null,
+        file_id: null, file_key: null, file_name: null, file_mime: null, file_size: null,
+      })
+      const chanConvId = `${gid}/${cid}`
+      if ($activeConv !== chanConvId) {
+        unreadCounts.update(c => ({ ...c, [cid]: (c[cid] ?? 0) + 1 }))
+      }
+    })
+  })
+  onDestroy(() => { unlistenChanMsg?.() })
+
+  let unlistenCtxMenu
+  onMount(async () => {
+    unlistenCtxMenu = await listen('ctx_menu_action', ({ payload }) => {
+      const { action, ctx } = payload
+      if (action === 'ctx_copy') {
+        navigator.clipboard.writeText(ctx.text)
+      } else if (action === 'ctx_pin') {
+        togglePin({ ts: ctx.ts, from: ctx.from })
+      } else if (action === 'ctx_save_note') {
+        invoke('save_note', { text: ctx.text }).catch(console.error)
+      } else if (action === 'ctx_delete_me') {
+        invoke('delete_message', { peerId: ctx.peer_id, msgTs: ctx.ts, forAll: false }).catch(console.error)
+        removeMessage(ctx.peer_id, ctx.ts, ctx.from)
+      } else if (action === 'ctx_delete_all') {
+        invoke('delete_message', { peerId: ctx.peer_id, msgTs: ctx.ts, forAll: true }).catch(console.error)
+        removeMessage(ctx.peer_id, ctx.ts, ctx.from)
+      }
+    })
+  })
+  onDestroy(() => { unlistenCtxMenu?.() })
+
+  let unlistenSched
+  onMount(async () => {
+    unlistenSched = await listen('scheduled_sent', ({ payload }) => {
+      if (payload.peer_id === convKey) {
+        invoke('list_scheduled', { peerId: convKey }).then(l => { scheduledMsgs = l }).catch(() => {})
+      }
+    })
+  })
+  onDestroy(() => { unlistenSched?.() })
+
+  // ── B10 Focus trap helper ──────────────────────────────────────────────────
+  function trapFocus(e) {
+    if (e.key !== 'Tab') return
+    const modal = e.currentTarget
+    const focusable = modal.querySelectorAll(
+      'button,[href],input,select,textarea,[tabindex]:not([tabindex="-1"])'
+    )
+    if (!focusable.length) return
+    const first = focusable[0], last = focusable[focusable.length - 1]
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus() }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus() }
   }
-
-  function copyMsg() {
-    navigator.clipboard.writeText(ctxText)
-    ctxVisible = false
-  }
-
-  async function saveToSaved() {
-    if (!ctxMsg) return
-    const text = ctxMsg.text ?? ctxMsg.file_name ?? ''
-    await invoke('save_note', { text }).catch(console.error)
-    ctxVisible = false
-  }
-
-  async function deleteForMe() {
-    if (!ctxMsg) return
-    await invoke('delete_message', { peerId, msgTs: ctxMsg.ts, forAll: false }).catch(console.error)
-    removeMessage(peerId, ctxMsg.ts, ctxMsg.from)
-    ctxVisible = false
-  }
-
-  async function deleteForAll() {
-    if (!ctxMsg || !ctxMine) return
-    await invoke('delete_message', { peerId, msgTs: ctxMsg.ts, forAll: true }).catch(console.error)
-    removeMessage(peerId, ctxMsg.ts, ctxMsg.from)
-    ctxVisible = false
-  }
-
-  function hideCtx() { ctxVisible = false }
 </script>
 
 <svelte:window
-  on:click={() => { hideCtx(); showMuteMenu = false; showTtlMenu = false }}
-  on:keydown={e => e.key === 'Escape' && (hideCtx(), showMuteMenu = false, showTtlMenu = false, cancelEdit(), showEditHistory = null, pickerVisible = {})}
+  on:click={() => { showMuteMenu = false; showTtlMenu = false; showRetentionMenu = false; showStickerPicker = false }}
+  on:keydown={e => e.key === 'Escape' && (showMuteMenu = false, showTtlMenu = false, showRetentionMenu = false, showSlashPalette = false, showMentionPicker = false, cancelEdit(), showEditHistory = null, pickerVisible = {}, showStickerPicker = false, showEventModal = false, showScheduleModal = false)}
 />
 
 <div class="pane">
   <div class="header">
+    {#if onToggleSidebar}
+      <button class="burger-btn" on:click={onToggleSidebar} aria-label="Open sidebar">☰</button>
+    {/if}
     {#if isSaved}
       <span class="saved-header-icon">🔖</span>
       <div class="header-info">
         <span class="peer-name">Saved Messages</span>
         <span class="peer-id">Your personal notes</span>
+      </div>
+    {:else if isChannel}
+      <span class="group-header-icon">#</span>
+      <div class="header-info">
+        <span class="peer-name">#{channelInfo?.name ?? channelId?.slice(0, 8) + '…'}</span>
+        <span class="peer-id">{channelGroupInfo?.name ?? ''}</span>
       </div>
     {:else if isGroup}
       <span class="group-header-icon">#</span>
@@ -1021,6 +1469,16 @@
       >🔒</button>
     {/if}
 
+    <!-- Detail panel toggle -->
+    {#if onToggleDetail}
+      <button
+        class="icon-hdr-btn"
+        class:active={detailOpen}
+        title={detailOpen ? 'Hide info panel' : 'Show info panel'}
+        on:click={onToggleDetail}
+      >ℹ</button>
+    {/if}
+
     <!-- Mute, TTL, Export controls (hidden for Saved Messages) -->
     <div class="header-extras" class:hidden={isSaved}>
       <!-- Mute button -->
@@ -1029,10 +1487,11 @@
           class="icon-hdr-btn"
           class:active-mute={muteSettings.is_muted}
           title={muteSettings.is_muted ? 'Unmute' : 'Mute'}
+          aria-label={muteSettings.is_muted ? 'Unmute conversation' : 'Mute conversation'}
           on:click|stopPropagation={() => showMuteMenu = !showMuteMenu}
         >{muteSettings.is_muted ? '🔕' : '🔔'}</button>
         {#if showMuteMenu}
-          <div class="popover" on:click|stopPropagation>
+          <div class="popover" role="menu" on:click|stopPropagation>
             {#if muteSettings.is_muted}
               <button class="pop-item" on:click={() => setMute(0)}>🔔 Unmute</button>
             {:else}
@@ -1051,10 +1510,11 @@
           class="icon-hdr-btn"
           class:active-ttl={ttl > 0}
           title="Disappearing messages"
+          aria-label="Set message expiry"
           on:click|stopPropagation={() => showTtlMenu = !showTtlMenu}
         >⏱</button>
         {#if showTtlMenu}
-          <div class="popover" on:click|stopPropagation>
+          <div class="popover" role="menu" on:click|stopPropagation>
             <button class="pop-item" class:selected={ttl===0}      on:click={() => setTtl(0)}>Off</button>
             <button class="pop-item" class:selected={ttl===86400}   on:click={() => setTtl(86400)}>24 hours</button>
             <button class="pop-item" class:selected={ttl===604800}  on:click={() => setTtl(604800)}>7 days</button>
@@ -1067,17 +1527,40 @@
       <button
         class="icon-hdr-btn"
         title="Export chat"
+        aria-label="Export chat"
         on:click|stopPropagation={() => showExport = !showExport}
       >⬇</button>
+
+      <!-- Retention button -->
+      <div class="popover-wrap">
+        <button
+          class="icon-hdr-btn"
+          title="Message retention"
+          aria-label="Set message retention limit"
+          class:active-ttl={retentionCount > 0}
+          on:click|stopPropagation={() => showRetentionMenu = !showRetentionMenu}
+        >♻</button>
+        {#if showRetentionMenu}
+          <div class="popover" role="menu" on:click|stopPropagation>
+            {#each RETENTION_OPTIONS as opt}
+              <button class="pop-item" class:selected={retentionCount === opt.value}
+                on:click={() => setRetention(opt.value)}>{opt.label}</button>
+            {/each}
+          </div>
+        {/if}
+      </div>
     </div>
   </div>
 
   <!-- Pinned messages banner -->
   {#if pinnedMsgs.length > 0}
-    <div class="pinned-banner" on:click|stopPropagation={() => {
-      if (pinnedMsgs.length === 1) scrollToPinned(pinnedMsgs[0])
-      else showPinnedList = !showPinnedList
-    }}>
+    <div class="pinned-banner" role="button" tabindex="0"
+      on:click|stopPropagation={() => {
+        if (pinnedMsgs.length === 1) scrollToPinned(pinnedMsgs[0])
+        else showPinnedList = !showPinnedList
+      }}
+      on:keydown={e => (e.key === 'Enter' || e.key === ' ') && (pinnedMsgs.length === 1 ? scrollToPinned(pinnedMsgs[0]) : (showPinnedList = !showPinnedList))}
+    >
       <span class="pin-icon">📌</span>
       <span class="pin-text">
         {#if pinnedMsgs.length === 1}
@@ -1107,6 +1590,29 @@
   {/if}
   {#if expiringCount > 0}
     <div class="expiring-banner">⚠ {expiringCount} message{expiringCount > 1 ? 's' : ''} disappear in &lt;1 hour</div>
+  {/if}
+  <!-- C15 Retention banner -->
+  {#if retentionCount > 0}
+    <div class="ttl-banner">♻ Keeping last {retentionCount.toLocaleString()} messages</div>
+  {/if}
+
+  <!-- Scheduled messages banner -->
+  {#if scheduledMsgs.length > 0}
+    <div class="sched-banner" on:click={() => showScheduledList = !showScheduledList} role="button" tabindex="0" on:keydown={e => e.key === 'Enter' && (showScheduledList = !showScheduledList)}>
+      🕐 {scheduledMsgs.length} scheduled {scheduledMsgs.length === 1 ? 'message' : 'messages'}
+      <span class="sched-chevron">{showScheduledList ? '▲' : '▼'}</span>
+    </div>
+    {#if showScheduledList}
+      <div class="sched-list">
+        {#each scheduledMsgs as sm (sm.id)}
+          <div class="sched-item">
+            <span class="sched-time">{fmtScheduledTime(sm.send_at_ms)}</span>
+            <span class="sched-text">{sm.text.length > 55 ? sm.text.slice(0, 55) + '…' : sm.text}</span>
+            <button class="sched-cancel-btn" title="Cancel" on:click|stopPropagation={() => cancelScheduled(sm.id)}>✕</button>
+          </div>
+        {/each}
+      </div>
+    {/if}
   {/if}
 
   <div
@@ -1150,7 +1656,11 @@
         : peerName}
       {@const msgKey = `${m.ts}_${m.from}`}
       {@const msgReactions = ($reactions[peerId] ?? {})[msgKey] ?? {}}
-      <div class="msg" class:mine role="listitem" data-ts={m.ts} on:contextmenu={e => showCtx(e, m, mine)}>
+      <div class="msg" class:mine role="listitem" data-ts={m.ts} on:contextmenu={e => {
+        e.preventDefault()
+        const isPinned = pinnedMsgs.some(p => p.msg_ts === m.ts && p.msg_from === m.from)
+        invoke('show_message_context_menu', { ctx: { peer_id: peerId, ts: m.ts, from: m.from, text: m.text ?? '', mine, is_pinned: isPinned } }).catch(console.error)
+      }}>
         {#if !mine}
           <Avatar name={senderName} uid={isGroup ? m.from : peerId} size={24} />
         {/if}
@@ -1246,8 +1756,46 @@
                 <button class="edit-save-btn" on:click={() => saveEdit(m)}>Save</button>
                 <button class="edit-cancel-btn" on:click={cancelEdit}>Cancel</button>
               </div>
+            {:else if m.sticker}
+              <div class="sticker-bubble">{m.sticker.id}</div>
+            {:else if m.location}
+              <div class="location-bubble">
+                <!-- svelte-ignore a11y-img-redundant-alt -->
+                <img
+                  class="location-map"
+                  src="https://staticmap.openstreetmap.de/staticmap.php?center={m.location.lat},{m.location.lng}&zoom=14&size=300x150&markers={m.location.lat},{m.location.lng}"
+                  alt="Map"
+                  loading="lazy"
+                />
+                <div class="location-footer">📍 Location{m.location.acc ? ` (±${m.location.acc}m)` : ''}</div>
+              </div>
+            {:else if m.event_data}
+              <div class="event-bubble">
+                <div class="event-title">📅 {m.event_data.title}</div>
+                <div class="event-date">{new Date(m.event_data.date_ms).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}</div>
+                {#if m.event_data.location}<div class="event-loc">📍 {m.event_data.location}</div>{/if}
+                {#if m.event_data.desc}<div class="event-desc">{m.event_data.desc}</div>{/if}
+                <div class="event-rsvp-btns">
+                  <button class="rsvp-btn yes" on:click={() => sendRsvp(m.event_data.date_ms, 'yes')}>✅ Going</button>
+                  <button class="rsvp-btn maybe" on:click={() => sendRsvp(m.event_data.date_ms, 'maybe')}>❓ Maybe</button>
+                  <button class="rsvp-btn no" on:click={() => sendRsvp(m.event_data.date_ms, 'no')}>❌ No</button>
+                </div>
+              </div>
+            {:else if m.rsvp}
+              <div class="rsvp-bubble">
+                <span class="rsvp-icon">{m.rsvp.status === 'yes' ? '✅' : m.rsvp.status === 'no' ? '❌' : '❓'}</span>
+                <span class="rsvp-label">{m.rsvp.status === 'yes' ? 'Going' : m.rsvp.status === 'no' ? 'Not going' : 'Maybe'}</span>
+              </div>
+            {:else if parsePollId(m.text)}
+              <PollView pollId={parsePollId(m.text)} {mine} />
             {:else}
-              {@html renderMd(m.text)}
+              {@html renderText(m)}
+              {#if translations[msgKey]}
+                <div class="translation-text">{translations[msgKey]}</div>
+              {/if}
+              {#if linkPreviews[msgKey] && linkPreviews[msgKey] !== 'loading'}
+                <LinkPreviewCard preview={linkPreviews[msgKey]} />
+              {/if}
             {/if}
             <span class="msg-meta">
               <span class="msg-ts">{formatTs(m.ts)}</span>
@@ -1327,12 +1875,20 @@
               text: m.text,
             }}
           >↩</button>
-          {#if mine && !m.file_id}
+          {#if mine && !m.file_id && !m.sticker && !m.location && !m.event_data && !m.rsvp}
             <button
               class="edit-btn"
               title="Edit message"
               on:click={() => startEdit(m)}
             >✏</button>
+          {/if}
+          {#if m.text && !m.file_id && !m.sticker && !m.location && !m.event_data && !m.rsvp}
+            <button
+              class="translate-btn"
+              title={translations[msgKey] ? 'Show original' : 'Translate'}
+              aria-label={translations[msgKey] ? 'Show original message' : 'Translate message'}
+              on:click={() => translateMsg(m)}
+            >{translating[msgKey] ? '…' : '🌐'}</button>
           {/if}
         </div>
       </div>
@@ -1363,6 +1919,37 @@
     </div>
   {/if}
 
+  {#if showSlashPalette}
+    <SlashCommandPalette
+      bind:this={slashPaletteRef}
+      query={slashQuery}
+      {isGroup}
+      onSelect={executeSlashCommand}
+    />
+  {/if}
+
+  {#if showMentionPicker && mentionCandidates.length > 0}
+    <div class="mention-picker" role="listbox" aria-label="Mention suggestions">
+      {#each mentionCandidates.slice(0, 8) as member (member.user_id)}
+        <button
+          type="button"
+          class="mention-item"
+          role="option"
+          on:mousedown|preventDefault={() => selectMention(member)}
+        >@{member.username}</button>
+      {/each}
+    </div>
+  {/if}
+
+  {#if showStickerPicker}
+    <div class="sticker-picker-wrap" on:click|stopPropagation>
+      <StickerPicker
+        onSelect={(s) => sendSticker(s)}
+        onClose={() => showStickerPicker = false}
+      />
+    </div>
+  {/if}
+
   <form class="compose" on:submit|preventDefault={send}>
     <input
       type="file"
@@ -1374,7 +1961,42 @@
     <button
       type="button"
       class="attach-btn"
+      title="Create poll"
+      aria-label="Create poll"
+      disabled={sending}
+      on:click={() => showPollModal = true}
+    >📊</button>
+    <button
+      type="button"
+      class="attach-btn"
+      title="Stickers"
+      aria-label="Stickers"
+      disabled={sending}
+      on:click|stopPropagation={() => showStickerPicker = !showStickerPicker}
+    >😊</button>
+    {#if isGroup || isChannel}
+    <button
+      type="button"
+      class="attach-btn"
+      title="Share location"
+      aria-label="Share location"
+      disabled={sending}
+      on:click={sendLocation}
+    >📍</button>
+    <button
+      type="button"
+      class="attach-btn"
+      title="Create event"
+      aria-label="Create event"
+      disabled={sending}
+      on:click={() => showEventModal = true}
+    >📅</button>
+    {/if}
+    <button
+      type="button"
+      class="attach-btn"
       title="Attach file"
+      aria-label="Attach file"
       disabled={sending}
       on:click={attachFile}
     >📎</button>
@@ -1411,6 +2033,7 @@
       class:recording={recState === 'voice' || recState === 'voice-locked'}
       class:locked={recState === 'voice-locked'}
       title="Hold for voice · tap for video"
+      aria-label="Record voice message"
       disabled={sending}
       on:pointerdown|preventDefault={onMicPointerDown}
       on:pointermove={onMicPointerMove}
@@ -1430,8 +2053,11 @@
         <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
       </button>
     {/if}
+    {#if recState === 'idle' && text.trim() && !isSaved}
+      <button type="button" class="sched-btn" title="Schedule for later" aria-label="Schedule message for later" on:click={() => showScheduleModal = true}>🕐</button>
+    {/if}
     {#if recState === 'idle'}
-      <button class="send-btn" type="submit" disabled={sending || !text.trim()} title="Send (Enter)">
+      <button class="send-btn" type="submit" disabled={sending || !text.trim()} title="Send (Enter)" aria-label="Send message">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
       </button>
     {/if}
@@ -1449,32 +2075,53 @@
   </div>
 {/if}
 
-{#if ctxVisible}
-  <div
-    class="ctx-menu"
-    style="left:{ctxX}px;top:{ctxY}px"
-    role="menu"
-    tabindex="-1"
-    on:click|stopPropagation
-    on:keydown|stopPropagation
-  >
-    <button class="ctx-item" on:click={copyMsg}>Copy</button>
-    <button class="ctx-item" on:click={() => ctxMsg && togglePin(ctxMsg)}>
-      {pinnedMsgs.some(p => p.msg_ts === ctxMsg?.ts && p.msg_from === ctxMsg?.from) ? 'Unpin' : 'Pin'}
-    </button>
-    <button class="ctx-item" on:click={saveToSaved}>Save to Saved</button>
-    <div class="ctx-divider"></div>
-    <button class="ctx-item ctx-delete" on:click={deleteForMe}>Delete for me</button>
-    {#if ctxMine}
-      <button class="ctx-item ctx-delete" on:click={deleteForAll}>Delete for all</button>
-    {/if}
+<!-- Poll creation modal -->
+{#if showPollModal}
+  <div class="modal-overlay" role="dialog" aria-modal="true" on:click|self={() => showPollModal = false}>
+    <div class="modal-box poll-modal" on:keydown={trapFocus}>
+      <div class="modal-title">Create Poll</div>
+      <input
+        class="modal-input"
+        type="text"
+        bind:value={pollQuestion}
+        placeholder="Question…"
+        maxlength="200"
+      />
+      <div class="poll-opts-list">
+        {#each pollOptions as _, i}
+          <div class="poll-opt-row">
+            <input
+              class="modal-input poll-opt-input"
+              type="text"
+              bind:value={pollOptions[i]}
+              placeholder="Option {i + 1}"
+              maxlength="100"
+            />
+            {#if pollOptions.length > 2}
+              <button class="poll-remove-btn" on:click={() => removePollOption(i)}>✕</button>
+            {/if}
+          </div>
+        {/each}
+      </div>
+      {#if pollOptions.length < 10}
+        <button class="poll-add-opt-btn" on:click={addPollOption}>+ Add option</button>
+      {/if}
+      <div class="modal-btns">
+        <button
+          class="modal-ok"
+          on:click={createAndSendPoll}
+          disabled={creatingPoll || !pollQuestion.trim() || pollOptions.filter(o => o.trim()).length < 2}
+        >{creatingPoll ? 'Creating…' : 'Create'}</button>
+        <button class="modal-cancel" on:click={() => showPollModal = false}>Cancel</button>
+      </div>
+    </div>
   </div>
 {/if}
 
 <!-- Export chat dialog -->
 {#if showExport}
-  <div class="modal-overlay" on:click|self={() => showExport = false}>
-    <div class="modal-box">
+  <div class="modal-overlay" role="dialog" aria-modal="true" on:click|self={() => showExport = false}>
+    <div class="modal-box" on:keydown={trapFocus}>
       <div class="modal-title">Export chat</div>
       <label class="modal-label">Format
         <select bind:value={exportFormat}>
@@ -1501,8 +2148,8 @@
 
 <!-- Edit history modal -->
 {#if showEditHistory}
-  <div class="modal-overlay" on:click|self={() => showEditHistory = null}>
-    <div class="modal-box">
+  <div class="modal-overlay" role="dialog" aria-modal="true" on:click|self={() => showEditHistory = null}>
+    <div class="modal-box" on:keydown={trapFocus}>
       <div class="modal-title">Edit history</div>
       {#if showEditHistory.history.length === 0}
         <p class="modal-empty">No history yet.</p>
@@ -1523,6 +2170,34 @@
 
 {#if showSafetyNumbers && !isGroup}
   <SafetyNumbers {peerId} {peerName} on:close={() => showSafetyNumbers = false} />
+{/if}
+
+{#if showEventModal && (isGroup || isChannel)}
+  <GroupEventModal
+    groupId={isChannel ? channelGroupId : peerId}
+    on:sent={() => { showEventModal = false; tick().then(scrollBottom) }}
+    on:close={() => showEventModal = false}
+  />
+{/if}
+
+<!-- C6 Schedule modal -->
+{#if showScheduleModal && !isSaved}
+  <div class="modal-overlay" on:click|self={() => showScheduleModal = false} role="dialog" aria-modal="true">
+    <div class="modal-box" on:keydown={trapFocus}>
+      <div class="modal-title">🕐 Schedule Message</div>
+      <div class="sched-preview">{text.trim() || '(type a message first)'}</div>
+      <input
+        type="datetime-local"
+        class="modal-input"
+        bind:value={scheduleDatetime}
+        min={new Date(Date.now() + 60000).toISOString().slice(0, 16)}
+      />
+      <div class="modal-btns">
+        <button class="modal-ok" disabled={!scheduleDatetime || !text.trim()} on:click={scheduleMessage}>Schedule</button>
+        <button class="modal-cancel" on:click={() => showScheduleModal = false}>Cancel</button>
+      </div>
+    </div>
+  </div>
 {/if}
 
 <!-- Video recording modal -->
@@ -1560,6 +2235,7 @@
     flex-direction: column;
     min-width: 0;
     background: var(--bg);
+    position: relative;
   }
 
   .header {
@@ -1570,6 +2246,16 @@
     align-items: center;
     gap: 10px;
   }
+  .burger-btn {
+    background: none;
+    color: var(--text-muted);
+    font-size: 18px;
+    padding: 2px 6px;
+    line-height: 1;
+    border-radius: 6px;
+    flex-shrink: 0;
+  }
+  .burger-btn:hover { background: var(--bg-hover); color: var(--text); }
   .header-info { display: flex; flex-direction: column; gap: 1px; flex: 1; }
   .peer-name { font-weight: 600; font-size: 15px; }
   .peer-id   { font-size: 11px; color: var(--text-dim); font-family: monospace; }
@@ -2076,31 +2762,6 @@
     to   { opacity: 1; transform: scale(1); }
   }
 
-  /* Context menu */
-  .ctx-menu {
-    position: fixed;
-    z-index: 200;
-    background: var(--bg-panel);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
-    overflow: hidden;
-    min-width: 120px;
-  }
-  .ctx-item {
-    display: block;
-    width: 100%;
-    background: none;
-    color: var(--text);
-    text-align: left;
-    padding: 8px 14px;
-    font-size: 13px;
-    border-radius: 0;
-  }
-  .ctx-item:hover { background: var(--bg-hover); }
-  .ctx-delete { color: #e05555; }
-  .ctx-delete:hover { background: rgba(224,85,85,0.12); }
-
   /* ── Group read receipts ─────────────────────────────────────────────────── */
   .grp-read-row {
     display: flex; align-items: center; gap: 3px;
@@ -2144,6 +2805,19 @@
     padding: 5px 16px; font-size: 11px; text-align: center;
     background: rgba(243,139,168,0.1); color: #f38ba8;
   }
+
+  /* ── C6 Scheduling ──────────────────────────────────────────────────────────── */
+  .sched-btn { background: none; font-size: 18px; padding: 4px 6px; color: var(--text-muted, #9399b2); line-height: 1; border: none; cursor: pointer; border-radius: 4px; }
+  .sched-btn:hover { background: var(--bg-hover, rgba(137,180,250,0.1)); color: var(--accent, #89b4fa); }
+  .sched-banner { display: flex; align-items: center; gap: 6px; padding: 5px 16px; background: color-mix(in srgb, var(--accent, #89b4fa) 8%, transparent); font-size: 12px; color: var(--text, #cdd6f4); cursor: pointer; border-bottom: 1px solid var(--border, rgba(255,255,255,0.06)); user-select: none; }
+  .sched-chevron { margin-left: auto; font-size: 10px; color: var(--text-muted, #9399b2); }
+  .sched-list { border-bottom: 1px solid var(--border, rgba(255,255,255,0.06)); }
+  .sched-item { display: flex; align-items: center; gap: 8px; padding: 6px 16px; font-size: 12px; border-top: 1px solid var(--border, rgba(255,255,255,0.06)); }
+  .sched-time { color: var(--accent, #89b4fa); white-space: nowrap; flex-shrink: 0; }
+  .sched-text { flex: 1; color: var(--text-muted, #9399b2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sched-cancel-btn { background: none; color: var(--text-muted, #9399b2); font-size: 12px; padding: 2px 6px; border-radius: 4px; border: none; cursor: pointer; flex-shrink: 0; }
+  .sched-cancel-btn:hover { background: rgba(243,139,168,0.2); color: #f38ba8; }
+  .sched-preview { padding: 8px 10px; background: var(--bg, #1e1e2e); border-radius: 6px; font-size: 13px; color: var(--text-muted, #9399b2); font-style: italic; max-height: 60px; overflow: hidden; text-overflow: ellipsis; margin-bottom: 12px; }
 
   /* ── Edit mode ────────────────────────────────────────────────────────────── */
   .edit-input {
@@ -2196,6 +2870,14 @@
   .modal-ok:disabled { opacity: 0.5; cursor: default; }
   .modal-cancel { flex: 1; padding: 7px; font-size: 12px; background: none; color: var(--text-muted); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; }
   .modal-empty { font-size: 12px; color: var(--text-dim); text-align: center; padding: 12px 0; }
+  .poll-modal { min-width: 280px; }
+  .poll-opts-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+  .poll-opt-row { display: flex; gap: 6px; align-items: center; }
+  .poll-opt-input { flex: 1; margin-bottom: 0 !important; }
+  .poll-remove-btn { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 13px; padding: 0 4px; flex-shrink: 0; }
+  .poll-remove-btn:hover { color: #e05555; }
+  .poll-add-opt-btn { background: none; border: 1px dashed var(--border); color: var(--accent); font-size: 11px; padding: 5px 10px; border-radius: 6px; cursor: pointer; width: 100%; margin-bottom: 10px; }
+  .poll-add-opt-btn:hover { background: var(--bg-hover); }
 
   /* ── Edit history list ────────────────────────────────────────────────────── */
   .hist-list { list-style: none; margin: 0 0 12px; padding: 0; max-height: 240px; overflow-y: auto; }
@@ -2333,8 +3015,6 @@
   .pinned-list-item:hover { background: var(--bg-hover); }
   .pin-item-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
 
-  .ctx-divider { height: 1px; background: var(--border); margin: 3px 0; }
-
   /* ── Send button ─────────────────────────────────────────────────────────── */
   .send-btn {
     width: 36px; height: 36px;
@@ -2429,4 +3109,117 @@
   :global([data-theme="light"] .hljs-title)      { color: #6f42c1; }
   :global([data-theme="light"] .hljs-tag)        { color: #22863a; }
   :global([data-theme="light"] .hljs-attr)       { color: #005cc5; }
+
+  /* ── @mention ── */
+  :global(mark.mention) {
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    color: var(--accent);
+    border-radius: 3px;
+    padding: 0 2px;
+    font-weight: 600;
+    font-style: normal;
+  }
+  :global(mark.mention.mention-mine) {
+    background: color-mix(in srgb, #f59e0b 18%, transparent);
+    color: #f59e0b;
+  }
+
+  .mention-picker {
+    border-top: 1px solid var(--border);
+    background: var(--bg-panel);
+    overflow-y: auto;
+    max-height: 160px;
+    flex-shrink: 0;
+  }
+  .mention-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 7px 14px;
+    background: none;
+    border-radius: 0;
+    font-size: 13px;
+    color: var(--accent);
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.1s;
+  }
+  .mention-item:hover, .mention-item:focus {
+    background: var(--bg-hover);
+    outline: none;
+  }
+
+  /* ── Sticker picker wrapper ───────────────────────────────────────────────── */
+  .sticker-picker-wrap {
+    position: absolute;
+    bottom: 70px;
+    left: 8px;
+    z-index: 100;
+  }
+
+  /* ── Sticker bubble ──────────────────────────────────────────────────────── */
+  .sticker-bubble {
+    font-size: 72px;
+    line-height: 1;
+    padding: 4px 0;
+    user-select: none;
+  }
+
+  /* ── Location bubble ─────────────────────────────────────────────────────── */
+  .location-bubble { display: flex; flex-direction: column; gap: 4px; }
+  .location-map {
+    width: 300px; max-width: 100%;
+    height: 150px; object-fit: cover;
+    border-radius: 8px;
+  }
+  .location-footer { font-size: 12px; color: var(--text-muted); }
+
+  /* ── Event bubble ────────────────────────────────────────────────────────── */
+  .event-bubble {
+    display: flex; flex-direction: column; gap: 4px;
+    padding: 2px 0;
+    min-width: 200px;
+  }
+  .event-title { font-weight: 700; font-size: 14px; }
+  .event-date { font-size: 12px; color: var(--text-muted); }
+  .event-loc { font-size: 12px; color: var(--text-muted); }
+  .event-desc { font-size: 12px; color: var(--text); margin-top: 2px; }
+  .event-rsvp-btns { display: flex; gap: 6px; margin-top: 6px; }
+  .rsvp-btn {
+    font-size: 11px; padding: 3px 8px;
+    border-radius: 12px;
+    background: var(--bg-hover);
+    border: 1px solid var(--border);
+    color: var(--text);
+    cursor: pointer;
+    transition: background 0.1s;
+  }
+  .rsvp-btn:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+  /* ── RSVP bubble ─────────────────────────────────────────────────────────── */
+  .rsvp-bubble {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 13px;
+  }
+  .rsvp-icon { font-size: 18px; }
+  .rsvp-label { font-style: italic; color: var(--text-muted); }
+
+  /* ── Translation ─────────────────────────────────────────────────────────── */
+  .translation-text {
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid rgba(128,128,128,0.2);
+    font-style: italic;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  .translate-btn {
+    background: none;
+    font-size: 13px;
+    padding: 2px 4px;
+    opacity: 0.6;
+    border-radius: 4px;
+    line-height: 1;
+  }
+  .translate-btn:hover { opacity: 1; background: var(--bg-hover); }
 </style>

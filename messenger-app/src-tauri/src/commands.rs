@@ -3,6 +3,10 @@ use ed25519_dalek::SigningKey;
 use native_tls;
 use rand::RngCore;
 use std::sync::atomic::Ordering;
+
+// ── Scheduler wakeup ──────────────────────────────────────────────────────────
+pub(crate) static SCHED_WAKEUP: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(|| tokio::sync::Notify::new());
 use messenger_crypto::{
     keys::{self, IdentityKeyPair, OneTimePreKey, PreKeyBundle, SignedPreKey},
     ratchet::RatchetState,
@@ -82,7 +86,7 @@ pub struct MessageView {
 
 /// Encode the wire payload as JSON v1, always including the sender's timestamp.
 /// The ts field lets the receiver use the canonical timestamp for edit/reaction lookup.
-fn encode_payload(text: &str, ts: i64, reply_to: Option<&ReplyInfo>) -> String {
+fn encode_payload(text: &str, ts: i64, reply_to: Option<&ReplyInfo>, mentions: Option<&[String]>) -> String {
     let mut obj = serde_json::json!({ "v": 1, "text": text, "ts": ts });
     if let Some(r) = reply_to {
         let quoted: String = if r.text.chars().count() > 100 {
@@ -91,6 +95,9 @@ fn encode_payload(text: &str, ts: i64, reply_to: Option<&ReplyInfo>) -> String {
             r.text.clone()
         };
         obj["r"] = serde_json::json!({ "ts": r.ts, "f": r.from, "t": quoted });
+    }
+    if let Some(m) = mentions {
+        if !m.is_empty() { obj["mentions"] = serde_json::json!(m); }
     }
     obj.to_string()
 }
@@ -272,6 +279,11 @@ pub async fn unlock(password: String, app: AppHandle) -> Result<bool, String> {
     let key_bf = key;
     db::backfill_fts(&conn, move |nonce, ct| store::decrypt_content(nonce, ct, &key_bf).ok());
 
+    // Retry failed scheduled messages within 60 s grace window (sent while offline).
+    db::retry_failed_scheduled(&conn, 60_000);
+    // Purge sent/cancelled scheduled rows older than 7 days.
+    db::cleanup_old_scheduled(&conn);
+
     *state.db.lock().unwrap() = Some(conn);
 
     // Background TTL cleanup — runs every 5 minutes while the app is open.
@@ -285,10 +297,22 @@ pub async fn unlock(password: String, app: AppHandle) -> Result<bool, String> {
                 let db_guard = state.db.lock().unwrap();
                 if let Some(ref conn) = *db_guard {
                     db::purge_expired(conn, now);
+                    // C15: enforce per-conversation message count limits
+                    for (pid, count) in db::get_all_retention_peers(conn) {
+                        db::enforce_retention_count(conn, &pid, count);
+                    }
                 }
             }
         });
     }
+
+    // Smart message scheduler — wakes exactly when the next scheduled message is due.
+    {
+        let app2 = app.clone();
+        tokio::spawn(run_scheduler(app2));
+    }
+    // Wake scheduler in case messages were just re-queued by retry_failed_scheduled.
+    SCHED_WAKEUP.notify_one();
 
     Ok(restored)
 }
@@ -622,6 +646,7 @@ pub async fn send_message(
     peer_id: String,
     text: String,
     reply_to: Option<ReplyInfo>,
+    mentions: Option<Vec<String>>,
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
     let state = app.state::<AppState>();
@@ -634,7 +659,7 @@ pub async fn send_message(
 
     // Compute timestamp before encoding so payload and DB row share the same ts.
     let ts = store::now_ms();
-    let payload = encode_payload(&text, ts, reply_to.as_ref());
+    let payload = encode_payload(&text, ts, reply_to.as_ref(), mentions.as_deref());
 
     // Build wire frame and snapshot sessions — both under the sessions lock,
     // sync crypto only, no .await inside.
@@ -1497,7 +1522,7 @@ async fn replenish_opks_if_needed(app: AppHandle) {
 
 // ── Group helpers ─────────────────────────────────────────────────────────────
 
-fn encode_group_payload(text: &str, ts: i64, group_id: &str, reply_to: Option<&ReplyInfo>) -> String {
+fn encode_group_payload(text: &str, ts: i64, group_id: &str, reply_to: Option<&ReplyInfo>, mentions: Option<&[String]>) -> String {
     let mut obj = serde_json::json!({ "v": 1, "text": text, "ts": ts, "gid": group_id });
     if let Some(r) = reply_to {
         let quoted: String = if r.text.chars().count() > 100 {
@@ -1506,6 +1531,9 @@ fn encode_group_payload(text: &str, ts: i64, group_id: &str, reply_to: Option<&R
             r.text.clone()
         };
         obj["r"] = serde_json::json!({ "ts": r.ts, "f": r.from, "t": quoted });
+    }
+    if let Some(m) = mentions {
+        if !m.is_empty() { obj["mentions"] = serde_json::json!(m); }
     }
     obj.to_string()
 }
@@ -1525,7 +1553,8 @@ pub async fn create_group(
     };
 
     #[derive(serde::Deserialize)]
-    struct MemberResp { user_id: String, username: String }
+    struct MemberResp { user_id: String, username: String, #[serde(default = "default_role")] role: String }
+    fn default_role() -> String { "member".to_string() }
     #[derive(serde::Deserialize)]
     struct GroupResp { group_id: String, name: String, members: Vec<MemberResp> }
 
@@ -1562,6 +1591,7 @@ pub async fn create_group(
         members: resp.members.iter().map(|m| crate::MemberInfo {
             user_id: m.user_id.clone(),
             username: m.username.clone(),
+            role: m.role.clone(),
         }).collect(),
     };
 
@@ -1587,7 +1617,8 @@ pub async fn load_groups(app: AppHandle) -> Result<Vec<crate::GroupInfo>, String
     };
 
     #[derive(serde::Deserialize)]
-    struct MemberResp { user_id: String, username: String }
+    struct MemberResp { user_id: String, username: String, #[serde(default = "default_role")] role: String }
+    fn default_role() -> String { "member".to_string() }
     #[derive(serde::Deserialize)]
     struct GroupResp { group_id: String, name: String, members: Vec<MemberResp> }
 
@@ -1623,6 +1654,7 @@ pub async fn load_groups(app: AppHandle) -> Result<Vec<crate::GroupInfo>, String
             members: g.members.iter().map(|m| crate::MemberInfo {
                 user_id: m.user_id.clone(),
                 username: m.username.clone(),
+                role: m.role.clone(),
             }).collect(),
         };
         state.groups.lock().unwrap().insert(g.group_id, gi.clone());
@@ -1738,6 +1770,8 @@ pub async fn send_group_message(
     group_id: String,
     text: String,
     reply_to: Option<ReplyInfo>,
+    mentions: Option<Vec<String>>,
+    payload_override: Option<String>,
     app: AppHandle,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
@@ -1758,7 +1792,17 @@ pub async fn send_group_message(
     };
 
     let ts = store::now_ms();
-    let payload = encode_group_payload(&text, ts, &group_id, reply_to.as_ref());
+    let payload = if let Some(raw) = &payload_override {
+        // Inject required ts + gid into caller-supplied JSON blob.
+        let mut obj: serde_json::Value = serde_json::from_str(raw)
+            .unwrap_or_else(|_| serde_json::json!({"v":1}));
+        obj["v"]   = serde_json::json!(1);
+        obj["ts"]  = serde_json::json!(ts);
+        obj["gid"] = serde_json::json!(&group_id);
+        obj.to_string()
+    } else {
+        encode_group_payload(&text, ts, &group_id, reply_to.as_ref(), mentions.as_deref())
+    };
     let (r_ts, r_from, r_text) = match &reply_to {
         Some(r) => (Some(r.ts), Some(r.from.clone()), Some(r.text.clone())),
         None => (None, None, None),
@@ -2253,6 +2297,116 @@ pub async fn leave_group(group_id: String, app: AppHandle) -> Result<(), String>
     Ok(())
 }
 
+// ── C11: roles / kick / transfer ─────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn set_member_role(
+    group_id: String,
+    user_id: String,
+    role: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let token = state.identity.lock().unwrap().as_ref().ok_or("not registered")?.token.clone();
+    state
+        .http
+        .patch(format!(
+            "{}/api/v1/groups/{}/members/{}/role",
+            state.server_url, group_id, user_id
+        ))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({ "role": role }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+
+    // Update local cache
+    state.groups.lock().unwrap().entry(group_id).and_modify(|g| {
+        for m in &mut g.members {
+            if m.user_id == user_id { m.role = role.clone(); }
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn kick_member(group_id: String, user_id: String, app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let token = state.identity.lock().unwrap().as_ref().ok_or("not registered")?.token.clone();
+    state
+        .http
+        .delete(format!("{}/api/v1/groups/{}/kick/{}", state.server_url, group_id, user_id))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+
+    state.groups.lock().unwrap().entry(group_id).and_modify(|g| {
+        g.members.retain(|m| m.user_id != user_id);
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn transfer_ownership(
+    group_id: String,
+    new_owner_id: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let (token, my_id) = {
+        let guard = state.identity.lock().unwrap();
+        let id = guard.as_ref().ok_or("not registered")?;
+        (id.token.clone(), id.user_id.clone())
+    };
+    state
+        .http
+        .post(format!("{}/api/v1/groups/{}/transfer", state.server_url, group_id))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({ "new_owner_id": new_owner_id }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+
+    // Update local cache atomically: old owner → admin, new owner → owner
+    state.groups.lock().unwrap().entry(group_id).and_modify(|g| {
+        for m in &mut g.members {
+            if m.user_id == my_id { m.role = "admin".to_string(); }
+            else if m.user_id == new_owner_id { m.role = "owner".to_string(); }
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn update_group_name(
+    group_id: String,
+    name: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let token = state.identity.lock().unwrap().as_ref().ok_or("not registered")?.token.clone();
+    state
+        .http
+        .patch(format!("{}/api/v1/groups/{}", state.server_url, group_id))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({ "name": name }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+
+    state.groups.lock().unwrap().entry(group_id).and_modify(|g| { g.name = name.clone(); });
+    Ok(())
+}
+
 // ── list_sessions ─────────────────────────────────────────────────────────────
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -2611,12 +2765,35 @@ pub fn get_edit_history(msg_id: i64, app: AppHandle) -> Vec<db::EditHistoryEntry
 
 // ── export_chat ───────────────────────────────────────────────────────────────
 
-fn ts_to_local_string(ts_ms: i64) -> String {
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    // Howard Hinnant's civil-from-days algorithm (public domain)
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    (y, mo, d)
+}
+
+fn ms_to_datetime_str(ts_ms: i64) -> String {
     let secs = ts_ms / 1000;
-    let hours = (secs / 3600) % 24;
-    let minutes = (secs / 60) % 60;
-    let year = 1970 + secs / 31_536_000;
-    format!("{year}-??-?? {hours:02}:{minutes:02}")
+    let h  = (secs / 3600) % 24;
+    let mi = (secs / 60) % 60;
+    let s  = secs % 60;
+    let days = secs / 86400;
+    let (y, mo, d) = civil_from_days(days);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
+}
+
+fn fmt_file_size(bytes: i64) -> String {
+    if bytes < 1024 { format!("{bytes} B") }
+    else if bytes < 1_048_576 { format!("{:.1} KB", bytes as f64 / 1024.0) }
+    else { format!("{:.1} MB", bytes as f64 / 1_048_576.0) }
 }
 
 fn format_chat_json(
@@ -2639,17 +2816,28 @@ fn format_chat_json(
                     "emoji": r.emoji
                 }))
                 .collect();
-            serde_json::json!({
+            let mut obj = serde_json::json!({
                 "ts": m.ts,
+                "datetime": ms_to_datetime_str(m.ts),
                 "direction": m.direction,
                 "sender": sender,
                 "text": m.plain,
                 "reactions": rxns,
-            })
+            });
+            if let Some(fname) = &m.file_name {
+                obj["file_name"] = serde_json::Value::String(fname.clone());
+                if let Some(fsize) = m.file_size {
+                    obj["file_size"] = serde_json::Value::Number(fsize.into());
+                }
+            }
+            obj
         })
         .collect();
-    serde_json::to_string_pretty(&serde_json::json!({ "messages": msgs_json }))
-        .unwrap_or_default()
+    serde_json::to_string_pretty(&serde_json::json!({
+        "exported_at": ms_to_datetime_str(store::now_ms()),
+        "messages": msgs_json
+    }))
+    .unwrap_or_default()
 }
 
 fn html_escape(s: &str) -> String {
@@ -2666,33 +2854,58 @@ fn format_chat_html(
 ) -> String {
     let mut html = String::from(
         "<!DOCTYPE html><html><head><meta charset='utf-8'>\
-         <style>body{font-family:sans-serif;max-width:800px;margin:0 auto;padding:20px}\
-         .msg{margin:10px 0;padding:10px;border-radius:8px}\
-         .sent{background:#dcf8c6;margin-left:20%}\
-         .received{background:#fff;margin-right:20%;border:1px solid #eee}\
-         .rxn{font-size:12px;color:#666;margin-top:4px}</style></head><body>",
+         <title>Chat Export</title>\
+         <style>\
+         body{font-family:system-ui,sans-serif;max-width:860px;margin:0 auto;padding:24px;background:#f5f5f5;color:#111}\
+         h1{font-size:18px;margin-bottom:4px}\
+         .meta{color:#666;font-size:12px;margin-bottom:20px}\
+         .msg{margin:8px 0;padding:10px 14px;border-radius:10px;max-width:72%;word-break:break-word}\
+         .sent{background:#d9f0ff;margin-left:auto}\
+         .received{background:#fff;border:1px solid #ddd}\
+         .sender{font-weight:700;font-size:12px;margin-bottom:2px}\
+         .body{font-size:14px;white-space:pre-wrap}\
+         .ts{font-size:10px;color:#999;margin-top:4px;text-align:right}\
+         .file{font-size:12px;color:#555;margin-top:4px}\
+         .rxn{font-size:12px;color:#666;margin-top:6px}\
+         .wrap{display:flex;flex-direction:column}\
+         </style></head><body><div class='wrap'>",
     );
+    html.push_str(&format!(
+        "<h1>Chat Export</h1><div class='meta'>Generated: {}</div>",
+        html_escape(&ms_to_datetime_str(store::now_ms()))
+    ));
     for m in messages {
         let sender = m.sender_id.as_deref()
             .and_then(|sid| peer_names.get(sid))
             .cloned()
-            .unwrap_or_else(|| m.direction.clone());
+            .unwrap_or_else(|| if m.direction == "sent" { "You".to_string() } else { "Them".to_string() });
         let cls = if m.direction == "sent" { "sent" } else { "received" };
-        html.push_str(&format!(
-            "<div class='msg {cls}'><strong>{}</strong><br>{}</div>",
-            html_escape(&sender), html_escape(&m.plain)
-        ));
+        html.push_str(&format!("<div class='msg {cls}'>"));
+        html.push_str(&format!("<div class='sender'>{}</div>", html_escape(&sender)));
+        if !m.plain.is_empty() {
+            html.push_str(&format!("<div class='body'>{}</div>", html_escape(&m.plain)));
+        }
+        if let Some(fname) = &m.file_name {
+            let size_str = m.file_size.map(fmt_file_size).unwrap_or_default();
+            html.push_str(&format!(
+                "<div class='file'>📎 {} {}</div>",
+                html_escape(fname),
+                html_escape(&size_str)
+            ));
+        }
+        html.push_str(&format!("<div class='ts'>{}</div>", html_escape(&ms_to_datetime_str(m.ts))));
         let rxns: Vec<_> = reactions.iter().filter(|r| r.msg_ts == m.ts).collect();
         if !rxns.is_empty() {
             html.push_str("<div class='rxn'>");
             for r in rxns {
                 let name = peer_names.get(&r.reactor_id).cloned().unwrap_or(r.reactor_id.clone());
-                html.push_str(&format!("{} {} &nbsp;", r.emoji, html_escape(&name)));
+                html.push_str(&format!("{} <em>{}</em>&nbsp; ", r.emoji, html_escape(&name)));
             }
             html.push_str("</div>");
         }
+        html.push_str("</div>");
     }
-    html.push_str("</body></html>");
+    html.push_str("</div></body></html>");
     html
 }
 
@@ -2701,18 +2914,35 @@ fn format_chat_markdown(
     reactions: &[db::ExportReaction],
     peer_names: &std::collections::HashMap<String, String>,
 ) -> String {
-    let mut md = String::from("# Chat Export\n\n");
+    let mut md = format!(
+        "# Chat Export\n\n_Generated: {}_\n\n---\n\n",
+        ms_to_datetime_str(store::now_ms())
+    );
     for m in messages {
         let sender = m.sender_id.as_deref()
             .and_then(|sid| peer_names.get(sid))
             .cloned()
-            .unwrap_or_else(|| m.direction.clone());
-        md.push_str(&format!("**{}**\n> {}\n\n", sender, m.plain));
-        let rxns: Vec<_> = reactions.iter().filter(|r| r.msg_ts == m.ts).collect();
-        for r in rxns {
-            let name = peer_names.get(&r.reactor_id).cloned().unwrap_or(r.reactor_id.clone());
-            md.push_str(&format!("{} _{}_  \n", r.emoji, name));
+            .unwrap_or_else(|| if m.direction == "sent" { "You".to_string() } else { "Them".to_string() });
+        let dt = ms_to_datetime_str(m.ts);
+        md.push_str(&format!("**{sender}** · _{dt}_\n"));
+        if !m.plain.is_empty() {
+            for line in m.plain.lines() {
+                md.push_str(&format!("> {line}\n"));
+            }
         }
+        if let Some(fname) = &m.file_name {
+            let size_str = m.file_size.map(fmt_file_size).unwrap_or_default();
+            md.push_str(&format!("> 📎 `{fname}` {size_str}\n"));
+        }
+        let rxns: Vec<_> = reactions.iter().filter(|r| r.msg_ts == m.ts).collect();
+        if !rxns.is_empty() {
+            let rxn_str: Vec<String> = rxns.iter().map(|r| {
+                let name = peer_names.get(&r.reactor_id).cloned().unwrap_or(r.reactor_id.clone());
+                format!("{} {name}", r.emoji)
+            }).collect();
+            md.push_str(&format!("> _{}_\n", rxn_str.join("  ")));
+        }
+        md.push('\n');
     }
     md
 }
@@ -3001,4 +3231,874 @@ pub async fn set_screen_capture_protection(
         window.set_content_protected(enabled).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+// ── Biometric unlock ──────────────────────────────────────────────────────────
+
+const KEYRING_SERVICE: &str = "veto-messenger";
+
+#[tauri::command]
+pub async fn has_biometric_unlock(app: AppHandle) -> bool {
+    let state = app.state::<AppState>();
+    let user_id = {
+        let guard = state.identity.lock().unwrap();
+        match guard.as_ref() {
+            Some(id) => id.user_id.clone(),
+            None => return false,
+        }
+    };
+    keyring::Entry::new(KEYRING_SERVICE, &user_id)
+        .map(|e| e.get_password().is_ok())
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+pub async fn save_biometric_unlock(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let (user_id, key) = {
+        let id = state.identity.lock().unwrap();
+        let user_id = id.as_ref().ok_or("not registered")?.user_id.clone();
+        let sk = state.session_key.lock().unwrap();
+        let key = sk.clone().ok_or("not unlocked")?;
+        (user_id, key)
+    };
+    let entry = keyring::Entry::new(KEYRING_SERVICE, &user_id).map_err(|e| e.to_string())?;
+    entry.set_password(&hex::encode(key)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_biometric_unlock(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let user_id = {
+        let guard = state.identity.lock().unwrap();
+        guard.as_ref().ok_or("not registered")?.user_id.clone()
+    };
+    let entry = keyring::Entry::new(KEYRING_SERVICE, &user_id).map_err(|e| e.to_string())?;
+    entry.delete_credential().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn try_biometric_unlock(app: AppHandle) -> Result<bool, String> {
+    use std::sync::atomic::Ordering;
+    let dir = store::data_dir(&app)?;
+    let state = app.state::<AppState>();
+
+    let user_id = {
+        let guard = state.identity.lock().unwrap();
+        match guard.as_ref() {
+            Some(id) => id.user_id.clone(),
+            None => return Ok(false),
+        }
+    };
+
+    // Retrieve stored key from OS keychain (triggers Windows Hello / Touch ID)
+    let key_hex = {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, &user_id).map_err(|e| e.to_string())?;
+        match entry.get_password() {
+            Ok(h) => h,
+            Err(_) => return Ok(false),
+        }
+    };
+
+    let key_bytes = hex::decode(&key_hex).map_err(|_| "stored key is invalid".to_string())?;
+    if key_bytes.len() != 32 {
+        return Err("stored key has wrong length".into());
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&key_bytes);
+
+    // Verify key by loading sessions (returns None if key is wrong)
+    let sessions = store::load_sessions(&dir, &key)
+        .await
+        .ok_or_else(|| "biometric key mismatch — please unlock with password".to_string())?;
+
+    {
+        let mut sess = state.sessions.lock().unwrap();
+        for (peer_id, session) in sessions {
+            sess.entry(peer_id).or_insert(session);
+        }
+    }
+    *state.session_key.lock().unwrap() = Some(key);
+
+    let conn = db::open(&dir)?;
+    let max = db::max_smid(&conn);
+    state.msg_counter.store(max + 1, Ordering::Relaxed);
+    let key_bf = key;
+    db::backfill_fts(&conn, move |nonce, ct| store::decrypt_content(nonce, ct, &key_bf).ok());
+    *state.db.lock().unwrap() = Some(conn);
+
+    // Start background TTL cleanup
+    let app2 = app.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            let state = app2.state::<AppState>();
+            let db_guard = state.db.lock().unwrap();
+            if let Some(ref conn) = *db_guard {
+                db::purge_expired(conn, store::now_ms());
+            }
+        }
+    });
+
+    Ok(true)
+}
+
+// ── Polls ─────────────────────────────────────────────────────────────────────
+
+async fn poll_auth(app: &AppHandle) -> Result<(String, String), String> {
+    let state = app.state::<AppState>();
+    let guard = state.identity.lock().unwrap();
+    let id = guard.as_ref().ok_or("not registered")?;
+    Ok((format!("{}/api/v1/polls", state.server_url), id.token.clone()))
+}
+
+#[tauri::command]
+pub async fn create_poll(
+    peer_id: String,
+    question: String,
+    options: Vec<String>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let (base_url, token) = poll_auth(&app).await?;
+    let state = app.state::<AppState>();
+    let resp: serde_json::Value = state.http
+        .post(&base_url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "peer_id": peer_id, "question": question, "options": options }))
+        .send().await.map_err(|e| e.to_string())?
+        .error_for_status().map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
+    resp["poll_id"].as_str().map(str::to_owned).ok_or_else(|| "no poll_id in response".into())
+}
+
+#[tauri::command]
+pub async fn get_poll(poll_id: String, app: AppHandle) -> Result<serde_json::Value, String> {
+    let (base_url, token) = poll_auth(&app).await?;
+    let state = app.state::<AppState>();
+    state.http
+        .get(format!("{}/{poll_id}", base_url))
+        .bearer_auth(&token)
+        .send().await.map_err(|e| e.to_string())?
+        .error_for_status().map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn vote_poll(poll_id: String, option_id: String, app: AppHandle) -> Result<serde_json::Value, String> {
+    let (base_url, token) = poll_auth(&app).await?;
+    let state = app.state::<AppState>();
+    state.http
+        .post(format!("{}/{poll_id}/vote", base_url))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "option_id": option_id }))
+        .send().await.map_err(|e| e.to_string())?
+        .error_for_status().map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn close_poll(poll_id: String, app: AppHandle) -> Result<serde_json::Value, String> {
+    let (base_url, token) = poll_auth(&app).await?;
+    let state = app.state::<AppState>();
+    state.http
+        .post(format!("{}/{poll_id}/close", base_url))
+        .bearer_auth(&token)
+        .send().await.map_err(|e| e.to_string())?
+        .error_for_status().map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())
+}
+
+// ── OS notifications ─────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn show_notification(title: String, body: String, app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_notification::NotificationExt;
+    app.notification()
+        .builder()
+        .title(&title)
+        .body(&body)
+        .show()
+        .map_err(|e| e.to_string())
+}
+
+// ── Native context menu ──────────────────────────────────────────────────────
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct CtxMenuContext {
+    pub peer_id: String,
+    pub ts: i64,
+    pub from: String,
+    pub text: String,
+    pub mine: bool,
+    pub is_pinned: bool,
+}
+
+#[tauri::command]
+pub async fn show_message_context_menu(
+    ctx: CtxMenuContext,
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+) -> Result<(), String> {
+    use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
+
+    {
+        let state = app.state::<crate::AppState>();
+        *state.ctx_menu_context.lock().unwrap() = Some(ctx.clone());
+    }
+
+    let copy = MenuItemBuilder::with_id("ctx_copy", "Copy")
+        .build(&app).map_err(|e| e.to_string())?;
+    let pin_label = if ctx.is_pinned { "Unpin" } else { "Pin" };
+    let pin = MenuItemBuilder::with_id("ctx_pin", pin_label)
+        .build(&app).map_err(|e| e.to_string())?;
+    let save = MenuItemBuilder::with_id("ctx_save_note", "Save to Saved")
+        .build(&app).map_err(|e| e.to_string())?;
+    let sep = PredefinedMenuItem::separator(&app).map_err(|e| e.to_string())?;
+    let del_me = MenuItemBuilder::with_id("ctx_delete_me", "Delete for me")
+        .build(&app).map_err(|e| e.to_string())?;
+
+    let menu = if ctx.mine {
+        let del_all = MenuItemBuilder::with_id("ctx_delete_all", "Delete for all")
+            .build(&app).map_err(|e| e.to_string())?;
+        MenuBuilder::new(&app)
+            .items(&[&copy, &pin, &save, &sep, &del_me, &del_all])
+            .build().map_err(|e| e.to_string())?
+    } else {
+        MenuBuilder::new(&app)
+            .items(&[&copy, &pin, &save, &sep, &del_me])
+            .build().map_err(|e| e.to_string())?
+    };
+
+    window.popup_menu(&menu).map_err(|e| e.to_string())
+}
+
+// ── C9 Channels ───────────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct ChannelResp {
+    channel_id: String,
+    group_id: String,
+    name: String,
+    description: Option<String>,
+    subscribed: bool,
+}
+
+fn channel_resp_to_info(c: ChannelResp) -> crate::ChannelInfo {
+    crate::ChannelInfo {
+        channel_id: c.channel_id,
+        group_id: c.group_id,
+        name: c.name,
+        description: c.description,
+        subscribed: c.subscribed,
+    }
+}
+
+#[tauri::command]
+pub async fn load_channels(group_id: String, app: AppHandle) -> Result<Vec<crate::ChannelInfo>, String> {
+    let state = app.state::<AppState>();
+    let (server_url, token) = {
+        let guard = state.identity.lock().unwrap();
+        let id = guard.as_ref().ok_or("not registered")?;
+        (state.server_url.clone(), id.token.clone())
+    };
+
+    let raw: Vec<ChannelResp> = state.http
+        .get(format!("{server_url}/api/v1/groups/{group_id}/channels"))
+        .bearer_auth(&token)
+        .send().await.map_err(|e| e.to_string())?
+        .error_for_status().map_err(|e| e.to_string())?
+        .json::<Vec<ChannelResp>>().await.map_err(|e| e.to_string())?;
+
+    let infos: Vec<crate::ChannelInfo> = raw.into_iter().map(channel_resp_to_info).collect();
+
+    // Cache in memory and in local DB.
+    {
+        let mut ch = state.channels.lock().unwrap();
+        for c in &infos { ch.insert(c.channel_id.clone(), c.clone()); }
+    }
+    {
+        let db = state.db.lock().unwrap();
+        if let Some(conn) = db.as_ref() {
+            for c in &infos {
+                let _ = db::upsert_channel(conn, &db::ChannelRow {
+                    channel_id: c.channel_id.clone(),
+                    group_id: c.group_id.clone(),
+                    name: c.name.clone(),
+                    description: c.description.clone(),
+                    subscribed: c.subscribed,
+                });
+            }
+        }
+    }
+
+    Ok(infos)
+}
+
+#[tauri::command]
+pub async fn create_channel(
+    group_id: String,
+    name: String,
+    description: Option<String>,
+    app: AppHandle,
+) -> Result<crate::ChannelInfo, String> {
+    let state = app.state::<AppState>();
+    let (server_url, token) = {
+        let guard = state.identity.lock().unwrap();
+        let id = guard.as_ref().ok_or("not registered")?;
+        (state.server_url.clone(), id.token.clone())
+    };
+
+    let resp: ChannelResp = state.http
+        .post(format!("{server_url}/api/v1/groups/{group_id}/channels"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": name, "description": description }))
+        .send().await.map_err(|e| e.to_string())?
+        .error_for_status().map_err(|e| e.to_string())?
+        .json::<ChannelResp>().await.map_err(|e| e.to_string())?;
+
+    let info = channel_resp_to_info(resp);
+    state.channels.lock().unwrap().insert(info.channel_id.clone(), info.clone());
+    {
+        let db = state.db.lock().unwrap();
+        if let Some(conn) = db.as_ref() {
+            let _ = db::upsert_channel(conn, &db::ChannelRow {
+                channel_id: info.channel_id.clone(),
+                group_id: info.group_id.clone(),
+                name: info.name.clone(),
+                description: info.description.clone(),
+                subscribed: info.subscribed,
+            });
+        }
+    }
+    Ok(info)
+}
+
+#[tauri::command]
+pub async fn delete_channel(
+    group_id: String,
+    channel_id: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let (server_url, token) = {
+        let guard = state.identity.lock().unwrap();
+        let id = guard.as_ref().ok_or("not registered")?;
+        (state.server_url.clone(), id.token.clone())
+    };
+
+    state.http
+        .delete(format!("{server_url}/api/v1/groups/{group_id}/channels/{channel_id}"))
+        .bearer_auth(&token)
+        .send().await.map_err(|e| e.to_string())?
+        .error_for_status().map_err(|e| e.to_string())?;
+
+    state.channels.lock().unwrap().remove(&channel_id);
+    {
+        let db = state.db.lock().unwrap();
+        if let Some(conn) = db.as_ref() { db::delete_channel(conn, &channel_id); }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn subscribe_channel(
+    group_id: String,
+    channel_id: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let (server_url, token) = {
+        let guard = state.identity.lock().unwrap();
+        let id = guard.as_ref().ok_or("not registered")?;
+        (state.server_url.clone(), id.token.clone())
+    };
+
+    state.http
+        .post(format!("{server_url}/api/v1/groups/{group_id}/channels/{channel_id}/subscribe"))
+        .bearer_auth(&token)
+        .send().await.map_err(|e| e.to_string())?
+        .error_for_status().map_err(|e| e.to_string())?;
+
+    let mut ch = state.channels.lock().unwrap();
+    if let Some(c) = ch.get_mut(&channel_id) { c.subscribed = true; }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn unsubscribe_channel(
+    group_id: String,
+    channel_id: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let (server_url, token) = {
+        let guard = state.identity.lock().unwrap();
+        let id = guard.as_ref().ok_or("not registered")?;
+        (state.server_url.clone(), id.token.clone())
+    };
+
+    state.http
+        .delete(format!("{server_url}/api/v1/groups/{group_id}/channels/{channel_id}/subscribe"))
+        .bearer_auth(&token)
+        .send().await.map_err(|e| e.to_string())?
+        .error_for_status().map_err(|e| e.to_string())?;
+
+    let mut ch = state.channels.lock().unwrap();
+    if let Some(c) = ch.get_mut(&channel_id) { c.subscribed = false; }
+    Ok(())
+}
+
+/// Send a message to a specific channel using CHANNEL_MAGIC frame.
+/// Uses the parent group's Sender Key for encryption.
+#[tauri::command]
+pub async fn send_channel_message(
+    channel_id: String,
+    group_id: String,
+    text: String,
+    reply_to: Option<ReplyInfo>,
+    mentions: Option<Vec<String>>,
+    payload_override: Option<String>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+
+    let my_user_id = {
+        let guard = state.identity.lock().unwrap();
+        guard.as_ref().ok_or("not registered")?.user_id.clone()
+    };
+    let session_key = state.session_key.lock().unwrap().clone().ok_or("not unlocked")?;
+
+    let ts = store::now_ms();
+    let payload = if let Some(raw) = &payload_override {
+        let mut obj: serde_json::Value = serde_json::from_str(raw)
+            .unwrap_or_else(|_| serde_json::json!({"v":1}));
+        obj["v"]   = serde_json::json!(1);
+        obj["ts"]  = serde_json::json!(ts);
+        obj["gid"] = serde_json::json!(&group_id);
+        obj["cid"] = serde_json::json!(&channel_id);
+        obj.to_string()
+    } else {
+        let mut obj = serde_json::json!({
+            "v": 1, "text": text, "ts": ts,
+            "gid": group_id, "cid": channel_id
+        });
+        if let Some(r) = &reply_to {
+            let quoted: String = if r.text.chars().count() > 100 {
+                r.text.chars().take(100).collect::<String>() + "..."
+            } else { r.text.clone() };
+            obj["r"] = serde_json::json!({ "ts": r.ts, "f": r.from, "t": quoted });
+        }
+        if let Some(m) = &mentions {
+            if !m.is_empty() { obj["mentions"] = serde_json::json!(m); }
+        }
+        obj.to_string()
+    };
+
+    let (r_ts, r_from, r_text) = match &reply_to {
+        Some(r) => (Some(r.ts), Some(r.from.clone()), Some(r.text.clone())),
+        None => (None, None, None),
+    };
+
+    // Use group Sender Key for channel encryption.
+    let sk_chain = {
+        let db = state.db.lock().unwrap();
+        db.as_ref().and_then(|c| crate::db::get_sender_chain(c, &group_id, &my_user_id))
+            .filter(|(_, _, distributed)| *distributed)
+    };
+
+    if let Some((chain_key, _, _)) = sk_chain {
+        let counter = {
+            let db = state.db.lock().unwrap();
+            db.as_ref()
+                .and_then(|c| crate::db::next_send_counter(c, &group_id, &my_user_id))
+                .ok_or("failed to get send counter")?
+        };
+        let sk_payload = messenger_crypto::sender_keys::encrypt(&chain_key, counter, payload.as_bytes());
+        let frame = client::build_channel_broadcast_frame(&group_id, &channel_id, &sk_payload);
+        if let Some(tx) = state.ws_tx.lock().unwrap().as_ref() {
+            let _ = tx.send(frame);
+        }
+    } else {
+        // No SK yet — trigger distribution and return error to retry.
+        let app2 = app.clone();
+        let gid2 = group_id.clone();
+        tokio::spawn(async move { distribute_sender_key(gid2, app2).await.ok(); });
+        return Err("sender key not ready, please retry".into());
+    }
+
+    // Store locally with peer_id = channel_id.
+    let (nonce, ct) = store::encrypt_content(&text, &session_key);
+    let db = state.db.lock().unwrap();
+    if let Some(ref conn) = *db {
+        let _ = crate::db::insert_group_sent(
+            conn, &channel_id, &my_user_id, ts, &nonce, &ct,
+            r_ts, r_from.as_deref(), r_text.as_deref(),
+            None, None, None, None, Some(text.as_str()), None,
+        );
+    }
+
+    Ok(())
+}
+
+// ── D6 Translation ────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn translate_message(
+    text: String,
+    target_lang: String,
+    app: AppHandle,
+) -> Result<String, String> {
+    let state = app.state::<AppState>();
+
+    let resp: serde_json::Value = state.http
+        .post("https://libretranslate.com/translate")
+        .json(&serde_json::json!({
+            "q": text,
+            "source": "auto",
+            "target": target_lang,
+            "format": "text"
+        }))
+        .send().await.map_err(|e| format!("translation request failed: {e}"))?
+        .json().await.map_err(|e| format!("translation parse failed: {e}"))?;
+
+    resp["translatedText"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            let err = resp["error"].as_str().unwrap_or("unknown error");
+            format!("translation error: {err}")
+        })
+}
+
+// ── D8 RSVP ──────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn send_rsvp(
+    group_id: String,
+    event_ts: i64,
+    status: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    if !["yes", "no", "maybe"].contains(&status.as_str()) {
+        return Err("status must be yes|no|maybe".into());
+    }
+    let payload = serde_json::json!({ "rsvp": { "event_ts": event_ts, "status": status } }).to_string();
+    // Re-use send_group_message with payload_override.
+    send_group_message(group_id, String::new(), None, None, Some(payload), app).await
+}
+
+// ── C6 Message Scheduling ─────────────────────────────────────────────────────
+
+/// Smart event-driven scheduler loop — sleeps until the next pending message is
+/// due, then fires it. Woken early by SCHED_WAKEUP on insert/cancel.
+pub(crate) async fn run_scheduler(app: AppHandle) {
+    use std::time::Duration;
+    loop {
+        let next = {
+            let state = app.state::<AppState>();
+            let guard = state.db.lock().unwrap();
+            guard.as_ref().and_then(|conn| db::get_next_scheduled_time(conn))
+        };
+        match next {
+            None => SCHED_WAKEUP.notified().await,
+            Some(t) => {
+                let delay = (t - store::now_ms()).max(0) as u64;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(delay)) => {
+                        send_due_scheduled(&app).await;
+                    }
+                    _ = SCHED_WAKEUP.notified() => { /* recalculate next */ }
+                }
+            }
+        }
+    }
+}
+
+/// Fetch and send all messages whose `send_at_ms <= now`. Internal — not a Tauri command.
+async fn send_due_scheduled(app: &AppHandle) {
+    let due = {
+        let state = app.state::<AppState>();
+        let guard = state.db.lock().unwrap();
+        guard.as_ref().map(|c| db::get_due_scheduled(c, store::now_ms())).unwrap_or_default()
+    };
+
+    for sm in due {
+        // Re-fetch row to guard against cancel race — skip if no longer pending.
+        {
+            let state = app.state::<AppState>();
+            let guard = state.db.lock().unwrap();
+            match guard.as_ref().and_then(|c| db::get_scheduled_by_id(c, sm.id)) {
+                Some(row) if row.status == "pending" => {}
+                _ => continue,
+            }
+        }
+
+        // Deserialise optional reply/mentions from stored JSON strings.
+        let reply_to: Option<ReplyInfo> = sm
+            .reply_to
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok());
+        let mentions: Option<Vec<String>> = sm
+            .mentions
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok());
+
+        let result = if sm.is_channel {
+            let cg = sm.channel_group_id.clone().unwrap_or_default();
+            send_channel_message(
+                sm.peer_id.clone(), cg, sm.text.clone(),
+                reply_to, mentions, None, app.clone(),
+            ).await.map(|_| ())
+        } else if sm.is_group {
+            send_group_message(
+                sm.peer_id.clone(), sm.text.clone(),
+                reply_to, mentions, None, app.clone(),
+            ).await.map(|_| ())
+        } else {
+            send_message(
+                sm.peer_id.clone(), sm.text.clone(),
+                reply_to, mentions, app.clone(),
+            ).await.map(|_| ())
+        };
+
+        {
+            let state = app.state::<AppState>();
+            let guard = state.db.lock().unwrap();
+            if let Some(conn) = guard.as_ref() {
+                match result {
+                    Ok(_) => db::mark_scheduled_sent(conn, sm.id),
+                    Err(ref e) => db::mark_scheduled_failed(conn, sm.id, e),
+                }
+            }
+        }
+
+        let _ = app.emit("scheduled_sent", serde_json::json!({
+            "id": sm.id,
+            "peer_id": sm.peer_id,
+        }));
+    }
+}
+
+#[tauri::command]
+pub async fn schedule_message(
+    peer_id: String,
+    text: String,
+    send_at_ms: i64,
+    is_group: bool,
+    is_channel: bool,
+    channel_group_id: Option<String>,
+    reply_to: Option<ReplyInfo>,
+    mentions: Option<Vec<String>>,
+    app: AppHandle,
+) -> Result<i64, String> {
+    if send_at_ms <= store::now_ms() {
+        return Err("Send time must be in the future".into());
+    }
+    let reply_json = reply_to
+        .map(|r| serde_json::to_string(&serde_json::json!({"ts":r.ts,"from":r.from,"text":r.text})))
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    let mentions_json = mentions
+        .map(|m| serde_json::to_string(&m))
+        .transpose()
+        .map_err(|e| e.to_string())?;
+
+    let id = {
+        let state = app.state::<AppState>();
+        let guard = state.db.lock().unwrap();
+        let conn = guard.as_ref().ok_or("db not open")?;
+        db::insert_scheduled(conn, &peer_id, is_group, is_channel, channel_group_id.as_deref(), &text, reply_json.as_deref(), mentions_json.as_deref(), send_at_ms)
+    };
+
+    SCHED_WAKEUP.notify_one();
+    Ok(id)
+}
+
+#[tauri::command]
+pub fn list_scheduled(peer_id: String, app: AppHandle) -> Result<Vec<db::ScheduledMsg>, String> {
+    let state = app.state::<AppState>();
+    let guard = state.db.lock().unwrap();
+    let conn = guard.as_ref().ok_or("db not open")?;
+    Ok(db::list_scheduled_for_peer(conn, &peer_id))
+}
+
+#[tauri::command]
+pub async fn cancel_scheduled(id: i64, app: AppHandle) -> Result<(), String> {
+    {
+        let state = app.state::<AppState>();
+        let guard = state.db.lock().unwrap();
+        let conn = guard.as_ref().ok_or("db not open")?;
+        db::set_scheduled_cancelled(conn, id);
+    }
+    SCHED_WAKEUP.notify_one();
+    Ok(())
+}
+
+// ── C3 Link Preview ───────────────────────────────────────────────────────────
+
+/// Returns true if `host` resolves to or IS a private/loopback/link-local address.
+/// Blocks SSRF: prevents fetching internal network resources via link preview.
+fn is_ssrf_blocked(host: &str) -> bool {
+    use std::net::{IpAddr, ToSocketAddrs};
+    // Block literal IP addresses that are non-public
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return ip.is_loopback() || ip.is_unspecified() || ip.is_multicast()
+            || match ip {
+                IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+                IpAddr::V6(v6) => v6.is_unicast_link_local(),
+            };
+    }
+    // DNS-resolve the hostname and check every returned address
+    match (host, 80u16).to_socket_addrs() {
+        Ok(addrs) => {
+            for addr in addrs {
+                let ip = addr.ip();
+                let blocked = ip.is_loopback() || ip.is_unspecified() || ip.is_multicast()
+                    || match ip {
+                        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+                        IpAddr::V6(v6) => v6.is_unicast_link_local(),
+                    };
+                if blocked { return true; }
+            }
+            false
+        }
+        // DNS failure → treat as blocked (don't fetch unresolvable hosts)
+        Err(_) => true,
+    }
+}
+
+#[tauri::command]
+pub async fn fetch_link_preview(url: String, app: AppHandle) -> Result<Option<db::LinkPreview>, String> {
+    use scraper::{Html, Selector};
+    use std::time::Duration;
+
+    // Require http/https
+    let parsed = match url::Url::parse(&url) {
+        Ok(u) if u.scheme() == "http" || u.scheme() == "https" => u,
+        _ => return Ok(None),
+    };
+    let host = match parsed.host_str() {
+        Some(h) => h.to_owned(),
+        None => return Ok(None),
+    };
+    let domain = host.clone();
+
+    // SSRF guard — run blocking DNS lookup on thread pool
+    let host_clone = host.clone();
+    let blocked = tokio::task::spawn_blocking(move || is_ssrf_blocked(&host_clone))
+        .await
+        .unwrap_or(true);
+    if blocked { return Ok(None); }
+
+    // Cache hit?
+    {
+        let state = app.state::<AppState>();
+        let guard = state.db.lock().unwrap();
+        if let Some(cached) = guard.as_ref().and_then(|c| db::get_cached_preview(c, &url)) {
+            return Ok(Some(cached));
+        }
+    }
+
+    // Fetch HTML
+    let state = app.state::<AppState>();
+    let response = match state.http
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (compatible; veto-bot/1.0)")
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+
+    // Only parse HTML responses
+    let ct = response.headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !ct.contains("text/html") { return Ok(None); }
+
+    // Cap at 512 KB
+    let bytes = match response.bytes().await {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    let body = String::from_utf8_lossy(&bytes[..bytes.len().min(524_288)]);
+
+    let doc = Html::parse_document(&body);
+
+    let meta_sel = Selector::parse("meta").unwrap();
+    let title_sel = Selector::parse("title").unwrap();
+
+    let mut og_title = None::<String>;
+    let mut og_desc  = None::<String>;
+    let mut og_image = None::<String>;
+
+    for meta in doc.select(&meta_sel) {
+        let prop = meta.value().attr("property").or_else(|| meta.value().attr("name")).unwrap_or("");
+        let content = meta.value().attr("content").unwrap_or("");
+        match prop {
+            "og:title"       | "twitter:title"       => { if og_title.is_none() { og_title = Some(content.to_owned()); } }
+            "og:description" | "twitter:description" => { if og_desc.is_none()  { og_desc  = Some(content.to_owned()); } }
+            "og:image"       | "twitter:image"       => { if og_image.is_none() { og_image = Some(content.to_owned()); } }
+            _ => {}
+        }
+    }
+
+    // Fallback to <title> tag
+    if og_title.is_none() {
+        og_title = doc.select(&title_sel).next()
+            .map(|n| n.text().collect::<String>().trim().to_owned())
+            .filter(|s| !s.is_empty());
+    }
+
+    // Nothing useful found
+    if og_title.is_none() && og_desc.is_none() { return Ok(None); }
+
+    // Validate image URL (must be http/https)
+    let image_url = og_image.filter(|u| u.starts_with("http://") || u.starts_with("https://"));
+
+    let preview = db::LinkPreview {
+        url: url.clone(),
+        title: og_title,
+        description: og_desc,
+        image_url,
+        domain,
+    };
+
+    // Cache it
+    {
+        let state2 = app.state::<AppState>();
+        let guard = state2.db.lock().unwrap();
+        if let Some(conn) = guard.as_ref() {
+            db::upsert_preview(conn, &preview);
+        }
+    }
+
+    Ok(Some(preview))
+}
+
+// ── C15 Data Retention ────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn set_retention(peer_id: String, retention_count: i64, app: AppHandle) -> Result<(), String> {
+    if retention_count < 0 { return Err("retention_count must be >= 0".into()); }
+    let state = app.state::<AppState>();
+    let guard = state.db.lock().unwrap();
+    let conn = guard.as_ref().ok_or("db not open")?;
+    db::set_retention_count(conn, &peer_id, retention_count);
+    if retention_count > 0 {
+        db::enforce_retention_count(conn, &peer_id, retention_count);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_retention(peer_id: String, app: AppHandle) -> Result<i64, String> {
+    let state = app.state::<AppState>();
+    let guard = state.db.lock().unwrap();
+    let conn = guard.as_ref().ok_or("db not open")?;
+    Ok(db::get_retention_count(conn, &peer_id))
 }

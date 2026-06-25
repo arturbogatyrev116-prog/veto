@@ -42,6 +42,9 @@ export const onlinePeers = writable(new Set())
 // { [group_id]: GroupInfo } — populated by load_groups / create_group
 export const groups = writable({})
 
+// { [group_id]: ChannelInfo[] } — populated by load_channels per group
+export const channels = writable({})
+
 export function removeMessage(peerId, ts, from) {
   conversations.update(convs => {
     const msgs = (convs[peerId] ?? []).filter(m => !(m.ts === ts && m.from === from))

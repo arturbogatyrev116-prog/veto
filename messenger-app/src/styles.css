@@ -182,3 +182,12 @@ textarea:focus { border-color: var(--accent); }
 /* ── Media bar layout shift ───────────────────────────────────────────────── */
 .app-root { height: 100vh; display: flex; flex-direction: column; }
 .app-root.media-bar-open { padding-top: 44px; height: 100vh; }
+
+/* ── Accessibility: reduced motion ──────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

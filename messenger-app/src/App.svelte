@@ -2,7 +2,7 @@
   import { onMount } from 'svelte'
   import { invoke } from '@tauri-apps/api/core'
   import { listen } from '@tauri-apps/api/event'
-  import { user, connLost, wsStatus, unlocked, activeConv, addMessage, addGroupMessage, typingPeers, conversations, onlinePeers, groups, showSearch, unreadCounts, reactions } from './stores.js'
+  import { user, connLost, wsStatus, unlocked, activeConv, addMessage, addGroupMessage, typingPeers, conversations, onlinePeers, groups, showSearch, unreadCounts, reactions, peerNames } from './stores.js'
   import Register from './lib/Register.svelte'
   import PasswordPrompt from './lib/PasswordPrompt.svelte'
   import Chat from './lib/Chat.svelte'
@@ -35,6 +35,23 @@
     } catch {}
   }
 
+  function playMention() {
+    try {
+      const ctx = new AudioContext()
+      const gain = ctx.createGain()
+      gain.connect(ctx.destination)
+      ;[0, 0.15].forEach(offset => {
+        const osc = ctx.createOscillator()
+        osc.connect(gain)
+        osc.frequency.value = 1100
+        osc.start(ctx.currentTime + offset)
+        osc.stop(ctx.currentTime + offset + 0.12)
+      })
+      gain.gain.setValueAtTime(0.18, ctx.currentTime)
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35)
+    } catch {}
+  }
+
   function isDndActive() {
     if (localStorage.getItem('dnd_enabled') !== 'true') return false
     const from = localStorage.getItem('dnd_from')
@@ -50,8 +67,13 @@
     return fromM <= toM ? (nowM >= fromM && nowM < toM) : (nowM >= fromM || nowM < toM)
   }
 
-  function notifyIfAllowed() {
-    if (!isDndActive()) playNotify()
+  function notifyIfAllowed(senderName, text) {
+    if (isDndActive()) return
+    playNotify()
+    if (!document.hasFocus()) {
+      const body = text ? (text.length > 120 ? text.slice(0, 117) + '…' : text) : '📎 File'
+      invoke('show_notification', { title: senderName, body }).catch(() => {})
+    }
   }
 
   // Reconnect with exponential backoff: 1s → 2s → 4s → … → 30s
@@ -134,7 +156,9 @@
       if (ac !== gid) {
         unreadCounts.update(c => ({ ...c, [gid]: (c[gid] ?? 0) + 1 }))
       }
-      notifyIfAllowed()
+      let grps; groups.subscribe(v => { grps = v })()
+      const groupName = grps?.[gid]?.name ?? 'Group'
+      notifyIfAllowed(groupName, text)
     })
 
     const unlistenMsg = await listen('message', ({ payload }) => {
@@ -162,7 +186,9 @@
       } else {
         unreadCounts.update(c => ({ ...c, [from]: (c[from] ?? 0) + 1 }))
       }
-      notifyIfAllowed()
+      let names; peerNames.subscribe(v => { names = v })()
+      const senderName = names?.[from] ?? (from.slice(0, 8) + '…')
+      notifyIfAllowed(senderName, text)
     })
 
     const unlistenConn = await listen('connection_lost', () => {
@@ -268,6 +294,17 @@
       })
     })
 
+    const unlistenMention = await listen('mention', ({ payload }) => {
+      if (isDndActive()) return
+      const { peer_id, from, text } = payload
+      playMention()
+      if (!document.hasFocus()) {
+        const senderName = $peerNames[from] ?? (from ?? '').slice(0, 8)
+        const body = text ? (text.length > 120 ? text.slice(0, 117) + '…' : text) : 'You were mentioned'
+        invoke('show_notification', { title: `@mention from ${senderName}`, body }).catch(() => {})
+      }
+    })
+
     const unlistenKt = await listen('kt_warning', ({ payload }) => {
       const { userId, reason } = payload
       ktWarning = `Security warning: key changed for ${(userId ?? '').slice(0, 8)}... — ${reason}`
@@ -289,7 +326,7 @@
       clearTimeout(reconnectTimer)
       unlistenMsg(); unlistenGroupMsg(); unlistenConn(); unlistenErr(); unlistenDelivered(); unlistenTyping()
       unlistenRead(); unlistenHello(); unlistenPresence(); unlistenReaction(); unlistenUpdate()
-      unlistenMemberLeft(); unlistenKt()
+      unlistenMemberLeft(); unlistenKt(); unlistenMention()
       Object.values(typingTimers).forEach(clearTimeout)
       Object.values(receiptTimers).forEach(clearTimeout)
     }

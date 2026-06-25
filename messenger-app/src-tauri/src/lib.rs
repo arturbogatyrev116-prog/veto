@@ -9,13 +9,26 @@ use std::{
 pub struct MemberInfo {
     pub user_id: String,
     pub username: String,
+    #[serde(default = "default_member_role")]
+    pub role: String,
 }
+
+fn default_member_role() -> String { "member".to_string() }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct GroupInfo {
     pub group_id: String,
     pub name: String,
     pub members: Vec<MemberInfo>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChannelInfo {
+    pub channel_id:  String,
+    pub group_id:    String,
+    pub name:        String,
+    pub description: Option<String>,
+    pub subscribed:  bool,
 }
 
 use messenger_crypto::{ratchet::RatchetState, x3dh::X3dhHeader};
@@ -79,6 +92,9 @@ pub struct AppState {
     pub outgoing_queue: Mutex<VecDeque<(u32, Vec<u8>)>>,
     /// Known group chats — populated by `create_group` and `load_groups`.
     pub groups: Mutex<HashMap<String, GroupInfo>>,
+    /// Channels per group — populated by `load_channels`.
+    /// Key = channel_id, Value = ChannelInfo.
+    pub channels: Mutex<HashMap<String, ChannelInfo>>,
     /// Peers to whom a read receipt must be sent on next successful connect.
     pub pending_receipts: Mutex<HashSet<String>>,
     /// Display names for peers — populated by prepare_session; used in notifications.
@@ -88,6 +104,8 @@ pub struct AppState {
     pub accept_invalid_certs: bool,
     pub http: reqwest::Client,
     pub server_url: String,
+    /// Context stored when showing a native popup context menu; read by on_menu_event handler.
+    pub ctx_menu_context: Mutex<Option<commands::CtxMenuContext>>,
 }
 
 impl AppState {
@@ -108,11 +126,13 @@ impl AppState {
             db: Mutex::new(None),
             outgoing_queue: Mutex::new(VecDeque::new()),
             groups: Mutex::new(HashMap::new()),
+            channels: Mutex::new(HashMap::new()),
             pending_receipts: Mutex::new(HashSet::new()),
             peer_names: Mutex::new(HashMap::new()),
             accept_invalid_certs,
             http,
             server_url,
+            ctx_menu_context: Mutex::new(None),
         }
     }
 }
@@ -258,6 +278,16 @@ pub fn run() {
 
             Ok(())
         })
+        .on_menu_event(|app, event| {
+            use tauri::Emitter;
+            let id = event.id.0.as_str();
+            if !id.starts_with("ctx_") { return; }
+            let state = app.state::<AppState>();
+            let ctx = state.ctx_menu_context.lock().unwrap().clone();
+            if let Some(ctx) = ctx {
+                let _ = app.emit("ctx_menu_action", serde_json::json!({ "action": id, "ctx": ctx }));
+            }
+        })
         .on_window_event(|window, event| {
             // Intercept window close → hide to system tray instead of quitting.
             // The app can only be fully exited via the tray menu "Quit".
@@ -290,6 +320,18 @@ pub fn run() {
             commands::send_group_file,
             commands::get_group_messages,
             commands::leave_group,
+            commands::set_member_role,
+            commands::kick_member,
+            commands::transfer_ownership,
+            commands::update_group_name,
+            commands::load_channels,
+            commands::create_channel,
+            commands::delete_channel,
+            commands::subscribe_channel,
+            commands::unsubscribe_channel,
+            commands::send_channel_message,
+            commands::translate_message,
+            commands::send_rsvp,
             commands::search_messages,
             commands::mark_as_read,
             commands::get_last_read_ts,
@@ -320,6 +362,22 @@ pub fn run() {
             commands::save_note,
             commands::get_chat_stats,
             commands::set_screen_capture_protection,
+            commands::show_message_context_menu,
+            commands::show_notification,
+            commands::has_biometric_unlock,
+            commands::save_biometric_unlock,
+            commands::delete_biometric_unlock,
+            commands::try_biometric_unlock,
+            commands::create_poll,
+            commands::get_poll,
+            commands::vote_poll,
+            commands::close_poll,
+            commands::schedule_message,
+            commands::list_scheduled,
+            commands::cancel_scheduled,
+            commands::fetch_link_preview,
+            commands::set_retention,
+            commands::get_retention,
             install_update,
         ])
         .run(tauri::generate_context!())

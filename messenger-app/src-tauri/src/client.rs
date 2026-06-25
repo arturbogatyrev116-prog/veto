@@ -61,6 +61,11 @@ pub const GROUP_READ_MAGIC: &[u8] = &[0xCA, 0xFE, 0x05, 0x00];
 /// No sender_id prefix — authenticated server-sent notification.
 pub const GROUP_MEMBER_LEFT_MAGIC: &[u8] = &[0xCA, 0xFE, 0x06, 0x00];
 
+/// Magic bytes for a channel broadcast frame (C9 Channels).
+/// Format: [CHANNEL_MAGIC: 4B][4B gid_len][gid][4B cid_len][cid][payload]
+/// Server fans out only to channel subscribers.
+pub const CHANNEL_MAGIC: &[u8] = &[0xCA, 0xFE, 0x0A, 0x00];
+
 // ── Frame helpers ─────────────────────────────────────────────────────────────
 
 /// Parse `[4B BE: len][str_bytes][rest]` → `(str, rest)`.
@@ -99,6 +104,7 @@ pub fn build_routing_frame(recipient_id: &str, wire_frame: &[u8], msg_id: u32) -
 struct ParsedMessage {
     text: String,
     gid: Option<String>,
+    cid: Option<String>,
     r_ts: Option<i64>,
     r_from: Option<String>,
     r_text: Option<String>,
@@ -119,6 +125,16 @@ struct ParsedMessage {
     del: Option<ParsedDelete>,
     /// Set when the message distributes a sender chain key.
     skd: Option<ParsedSKD>,
+    /// UUIDs of mentioned users (parsed from v1 payload "mentions" array).
+    mentions: Vec<String>,
+    /// D5: sticker payload `{"pack":"...","id":"..."}`.
+    sticker: Option<serde_json::Value>,
+    /// D4: location payload `{"lat":...,"lng":...,"acc":...}`.
+    location: Option<serde_json::Value>,
+    /// D8: group event payload.
+    event_data: Option<serde_json::Value>,
+    /// D8: RSVP payload.
+    rsvp: Option<serde_json::Value>,
 }
 
 struct ParsedEdit {
@@ -157,7 +173,7 @@ struct ParsedReaction {
 /// - JSON v1 reaction:     `{"v":1,"react":{"msg_ts":N,"msg_from":"...","emoji":"...","add":bool}}`
 fn parse_message_payload(s: &str, fallback_peer_id: &str) -> ParsedMessage {
     let empty_reaction = ParsedMessage {
-        text: String::new(), gid: None,
+        text: String::new(), gid: None, cid: None,
         r_ts: None, r_from: None, r_text: None,
         file_id: None, file_key: None, file_name: None, file_mime: None, file_size: None,
         thumb_data: None,
@@ -166,6 +182,11 @@ fn parse_message_payload(s: &str, fallback_peer_id: &str) -> ParsedMessage {
         edit: None,
         del: None,
         skd: None,
+        mentions: vec![],
+        sticker: None,
+        location: None,
+        event_data: None,
+        rsvp: None,
     };
     let plain = |text: String| ParsedMessage { text, ..empty_reaction.clone() };
     if !s.starts_with('{') {
@@ -187,6 +208,7 @@ fn parse_message_payload(s: &str, fallback_peer_id: &str) -> ParsedMessage {
         text: Option<String>,
         ts: Option<i64>,
         gid: Option<String>,
+        cid: Option<String>,
         r: Option<V1Reply>,
         file_id: Option<String>,
         key: Option<Vec<u8>>,
@@ -199,6 +221,11 @@ fn parse_message_payload(s: &str, fallback_peer_id: &str) -> ParsedMessage {
         edit: Option<V1Edit>,
         del: Option<V1Del>,
         skd: Option<V1Skd>,
+        mentions: Option<Vec<String>>,
+        sticker: Option<serde_json::Value>,
+        location: Option<serde_json::Value>,
+        event: Option<serde_json::Value>,
+        rsvp: Option<serde_json::Value>,
     }
     let Ok(msg) = serde_json::from_str::<V1Msg>(s) else {
         return plain(s.to_string());
@@ -207,6 +234,7 @@ fn parse_message_payload(s: &str, fallback_peer_id: &str) -> ParsedMessage {
         return plain(s.to_string());
     }
     let gid = msg.gid;
+    let cid = msg.cid;
     // Reaction message.
     if let Some(react) = msg.react {
         let peer_id = gid.clone().unwrap_or_else(|| fallback_peer_id.to_string());
@@ -258,6 +286,23 @@ fn parse_message_payload(s: &str, fallback_peer_id: &str) -> ParsedMessage {
             };
         }
     }
+    // Sticker message.
+    if let Some(sticker) = msg.sticker {
+        return ParsedMessage { gid, cid, sticker: Some(sticker), ..empty_reaction };
+    }
+    // Location message.
+    if let Some(location) = msg.location {
+        return ParsedMessage { gid, cid, location: Some(location), ..empty_reaction };
+    }
+    // Group event message.
+    if let Some(event) = msg.event {
+        return ParsedMessage { gid, cid, event_data: Some(event), ..empty_reaction };
+    }
+    // RSVP message.
+    if let Some(rsvp) = msg.rsvp {
+        return ParsedMessage { gid, cid, rsvp: Some(rsvp), ..empty_reaction };
+    }
+
     // File message — all fields must be present.
     if let (Some(fid), Some(key), Some(name), Some(mime), Some(size)) =
         (msg.file_id, msg.key, msg.name, msg.mime, msg.size)
@@ -276,7 +321,7 @@ fn parse_message_payload(s: &str, fallback_peer_id: &str) -> ParsedMessage {
         };
         return ParsedMessage {
             text: String::new(),
-            gid,
+            gid, cid,
             r_ts: None, r_from: None, r_text: None,
             file_id: Some(fid),
             file_key: Some(key),
@@ -289,6 +334,8 @@ fn parse_message_payload(s: &str, fallback_peer_id: &str) -> ParsedMessage {
             edit: None,
             del: None,
             skd: None,
+            mentions: vec![],
+            sticker: None, location: None, event_data: None, rsvp: None,
         };
     }
     // Text message.
@@ -299,7 +346,7 @@ fn parse_message_payload(s: &str, fallback_peer_id: &str) -> ParsedMessage {
             None    => (None, None, None),
         };
         return ParsedMessage {
-            text, gid,
+            text, gid, cid,
             r_ts, r_from, r_text,
             file_id: None, file_key: None, file_name: None, file_mime: None, file_size: None,
             thumb_data: None,
@@ -308,6 +355,8 @@ fn parse_message_payload(s: &str, fallback_peer_id: &str) -> ParsedMessage {
             edit: None,
             del: None,
             skd: None,
+            mentions: msg.mentions.unwrap_or_default(),
+            sticker: None, location: None, event_data: None, rsvp: None,
         };
     }
     plain(s.to_string())
@@ -318,6 +367,7 @@ impl Clone for ParsedMessage {
         ParsedMessage {
             text: self.text.clone(),
             gid: self.gid.clone(),
+            cid: self.cid.clone(),
             r_ts: self.r_ts,
             r_from: self.r_from.clone(),
             r_text: self.r_text.clone(),
@@ -332,6 +382,11 @@ impl Clone for ParsedMessage {
             edit: None,
             del: None,
             skd: None,
+            mentions: vec![],
+            sticker: None,
+            location: None,
+            event_data: None,
+            rsvp: None,
         }
     }
 }
@@ -419,6 +474,20 @@ pub fn build_group_broadcast_frame(gid: &str, payload: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// Build a channel broadcast frame: `[CHANNEL_MAGIC][4B gid_len][gid][4B cid_len][cid][payload]`
+pub fn build_channel_broadcast_frame(gid: &str, cid: &str, payload: &[u8]) -> Vec<u8> {
+    let gid_bytes = gid.as_bytes();
+    let cid_bytes = cid.as_bytes();
+    let mut frame = Vec::with_capacity(4 + 4 + gid_bytes.len() + 4 + cid_bytes.len() + payload.len());
+    frame.extend_from_slice(CHANNEL_MAGIC);
+    frame.extend_from_slice(&(gid_bytes.len() as u32).to_be_bytes());
+    frame.extend_from_slice(gid_bytes);
+    frame.extend_from_slice(&(cid_bytes.len() as u32).to_be_bytes());
+    frame.extend_from_slice(cid_bytes);
+    frame.extend_from_slice(payload);
+    frame
+}
+
 /// Build a group read receipt frame: `[GROUP_READ_MAGIC][4B gid_len][gid][8B ts_ms BE]`
 pub fn build_group_read_frame(gid: &str, ts_ms: i64) -> Vec<u8> {
     let gid_bytes = gid.as_bytes();
@@ -498,6 +567,12 @@ fn handle_group_broadcast(app: &AppHandle, sender_id: &str, wire_frame: &[u8]) {
     let parsed = parse_message_payload(&raw_text, sender_id);
     let ts = store::now_ms();
 
+    let mentions_json: Option<String> = if !parsed.mentions.is_empty() {
+        serde_json::to_string(&parsed.mentions).ok()
+    } else {
+        None
+    };
+
     // Persist to local DB.
     {
         let state = app.state::<AppState>();
@@ -522,6 +597,7 @@ fn handle_group_broadcast(app: &AppHandle, sender_id: &str, wire_frame: &[u8]) {
                     None,
                     None,
                     Some(parsed.text.as_str()), None,
+                    mentions_json.as_deref(),
                 );
             }
         }
@@ -541,8 +617,31 @@ fn handle_group_broadcast(app: &AppHandle, sender_id: &str, wire_frame: &[u8]) {
         "file_mime":    parsed.file_mime,
         "file_size":    parsed.file_size,
         "thumb_data":   parsed.thumb_data,
+        "mentions":     parsed.mentions,
+        "sticker":      parsed.sticker,
+        "location":     parsed.location,
+        "event_data":   parsed.event_data,
+        "rsvp":         parsed.rsvp,
         "sk":           true,
     })).ok();
+
+    // Emit mention event if current user is mentioned.
+    if !parsed.mentions.is_empty() {
+        let my_uid = app.state::<AppState>()
+            .identity.lock().unwrap()
+            .as_ref()
+            .map(|i| i.user_id.clone());
+        if let Some(uid) = my_uid {
+            if parsed.mentions.contains(&uid) {
+                app.emit("mention", json!({
+                    "peer_id": gid,
+                    "from": sender_id,
+                    "text": &parsed.text,
+                    "ts": ts,
+                })).ok();
+            }
+        }
+    }
 
     // System notification.
     let focused = app
@@ -567,6 +666,71 @@ fn handle_group_broadcast(app: &AppHandle, sender_id: &str, wire_frame: &[u8]) {
             .body(if parsed.text.is_empty() { "📎 File" } else { parsed.text.as_str() })
             .show();
     }
+}
+
+/// Handle `[CHANNEL_MAGIC][4B gid_len][gid][4B cid_len][cid][sk_payload]` frames.
+/// Decrypts using the parent group's Sender Key, then emits a "channel_message" event.
+fn handle_channel_broadcast(app: &AppHandle, sender_id: &str, wire_frame: &[u8]) {
+    // Parse gid and cid from frame header.
+    let after_magic = &wire_frame[4..];
+    let Some((gid, rest)) = parse_u32_len_prefix(after_magic) else { return; };
+    let Some((cid, sk_payload)) = parse_u32_len_prefix(rest) else { return; };
+
+    // Use parent group's sender chain key.
+    let chain_key_opt = {
+        let state = app.state::<AppState>();
+        let db = state.db.lock().unwrap();
+        db.as_ref().and_then(|c| crate::db::get_sender_chain(c, gid, sender_id))
+    };
+    let Some((chain_key, _, _)) = chain_key_opt else {
+        tracing::warn!(gid, cid, sender_id, "no sender chain key for channel broadcast");
+        return;
+    };
+
+    let Ok((plaintext_bytes, _counter)) = messenger_crypto::sender_keys::decrypt(&chain_key, sk_payload) else {
+        tracing::warn!(gid, cid, sender_id, "channel SK decrypt failed");
+        return;
+    };
+    let Ok(raw_text) = String::from_utf8(plaintext_bytes) else { return; };
+
+    let parsed = parse_message_payload(&raw_text, sender_id);
+    let ts = store::now_ms();
+
+    // Store with peer_id = channel_id.
+    {
+        let state = app.state::<AppState>();
+        let session_key = state.session_key.lock().unwrap().clone();
+        if let Some(ref key) = session_key {
+            let db = state.db.lock().unwrap();
+            if let Some(ref conn) = *db {
+                let (nonce, ct) = store::encrypt_content(&parsed.text, key);
+                let _ = crate::db::insert_group_received(
+                    conn, cid, sender_id, ts, &nonce, &ct, None,
+                    parsed.r_ts, parsed.r_from.as_deref(), parsed.r_text.as_deref(),
+                    None, None, None, None,
+                    Some(parsed.text.as_str()), None, None,
+                );
+            }
+        }
+    }
+
+    app.emit("channel_message", json!({
+        "gid":  gid,
+        "cid":  cid,
+        "from": sender_id,
+        "text": parsed.text,
+        "ts":   ts,
+        "reply_to_ts":   parsed.r_ts,
+        "reply_to_from": parsed.r_from,
+        "reply_to_text": parsed.r_text,
+        "file_id":   parsed.file_id,
+        "file_key":  parsed.file_key,
+        "file_name": parsed.file_name,
+        "file_mime": parsed.file_mime,
+        "file_size": parsed.file_size,
+        "sticker":   parsed.sticker,
+        "location":  parsed.location,
+    })).ok();
 }
 
 /// Handle a server-sent GROUP_MEMBER_LEFT_MAGIC frame (no sender_id prefix).
@@ -698,6 +862,12 @@ pub async fn ws_loop(
                 // Sender Key group broadcast: [GROUP_MAGIC][4B gid_len][gid][4B counter][ciphertext]
                 if wire_frame.len() >= 4 && &wire_frame[..4] == GROUP_MAGIC {
                     handle_group_broadcast(&app_handle, &sender_id, wire_frame);
+                    continue;
+                }
+
+                // Channel broadcast: [CHANNEL_MAGIC][4B gid_len][gid][4B cid_len][cid][4B counter][ciphertext]
+                if wire_frame.len() >= 4 && &wire_frame[..4] == CHANNEL_MAGIC {
+                    handle_channel_broadcast(&app_handle, &sender_id, wire_frame);
                     continue;
                 }
 
@@ -909,6 +1079,11 @@ pub async fn ws_loop(
 
                         // Persist to local DB before emitting; INSERT OR IGNORE in case
                         // a race slipped past the hash check above.
+                        let mentions_json: Option<String> = if !parsed.mentions.is_empty() {
+                            serde_json::to_string(&parsed.mentions).ok()
+                        } else {
+                            None
+                        };
                         {
                             let state = app_handle.state::<AppState>();
                             let session_key = state.session_key.lock().unwrap().clone();
@@ -940,6 +1115,7 @@ pub async fn ws_loop(
                                                     parsed.file_size,
                                                     parsed.file_name.as_deref(),
                                                     parsed.thumb_data.as_deref(),
+                                                    None,
                                                 );
                                             } else {
                                                 let _ = crate::db::insert_received(
@@ -958,6 +1134,7 @@ pub async fn ws_loop(
                                                     parsed.file_size,
                                                     parsed.file_name.as_deref(),
                                                     parsed.thumb_data.as_deref(),
+                                                    None,
                                                 );
                                             }
                                         }
@@ -980,6 +1157,7 @@ pub async fn ws_loop(
                                                     None,
                                                     None,
                                                     Some(parsed.text.as_str()), None,
+                                                    mentions_json.as_deref(),
                                                 );
                                             } else {
                                                 let _ = crate::db::insert_received(
@@ -997,6 +1175,7 @@ pub async fn ws_loop(
                                                     None,
                                                     None,
                                                     Some(parsed.text.as_str()), None,
+                                                    mentions_json.as_deref(),
                                                 );
                                             }
                                         }
@@ -1021,6 +1200,11 @@ pub async fn ws_loop(
                                     "file_mime": parsed.file_mime,
                                     "file_size": parsed.file_size,
                                     "thumb_data": parsed.thumb_data,
+                                    "mentions": &parsed.mentions,
+                                    "sticker": parsed.sticker,
+                                    "location": parsed.location,
+                                    "event_data": parsed.event_data,
+                                    "rsvp": parsed.rsvp,
                                 }))
                                 .ok();
                         } else {
@@ -1038,8 +1222,32 @@ pub async fn ws_loop(
                                     "file_mime": parsed.file_mime,
                                     "file_size": parsed.file_size,
                                     "thumb_data": parsed.thumb_data,
+                                    "mentions": &parsed.mentions,
+                                    "sticker": parsed.sticker,
+                                    "location": parsed.location,
+                                    "event_data": parsed.event_data,
+                                    "rsvp": parsed.rsvp,
                                 }))
                                 .ok();
+                        }
+
+                        // Emit mention event if current user is explicitly @mentioned.
+                        if !parsed.mentions.is_empty() {
+                            let my_uid = app_handle.state::<AppState>()
+                                .identity.lock().unwrap()
+                                .as_ref()
+                                .map(|i| i.user_id.clone());
+                            if let Some(uid) = my_uid {
+                                if parsed.mentions.contains(&uid) {
+                                    let peer_id = parsed.gid.as_deref().unwrap_or(&sender_id);
+                                    app_handle.emit("mention", json!({
+                                        "peer_id": peer_id,
+                                        "from": &sender_id,
+                                        "text": &parsed.text,
+                                        "ts": ts,
+                                    })).ok();
+                                }
+                            }
                         }
 
                         // System notification — only when the main window is not focused and chat isn't muted.

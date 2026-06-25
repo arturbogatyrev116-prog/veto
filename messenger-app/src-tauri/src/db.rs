@@ -75,6 +75,7 @@ pub fn open(data_dir: &Path) -> Result<Connection, String> {
     let _ = conn.execute_batch("ALTER TABLE conv_meta ADD COLUMN ttl_seconds            INTEGER NOT NULL DEFAULT 0;");
     let _ = conn.execute_batch("ALTER TABLE messages  ADD COLUMN edited_at   INTEGER;");
     let _ = conn.execute_batch("ALTER TABLE messages  ADD COLUMN edit_count  INTEGER NOT NULL DEFAULT 0;");
+    let _ = conn.execute_batch("ALTER TABLE messages  ADD COLUMN mentions    TEXT;"); // JSON array of user_id strings
 
     exec(&conn,
         "CREATE TABLE IF NOT EXISTS message_edits (\
@@ -158,6 +159,63 @@ pub fn open(data_dir: &Path) -> Result<Connection, String> {
         );",
     )?;
 
+    // Channels: sub-rooms within groups.
+    exec(&conn,
+        "CREATE TABLE IF NOT EXISTS channels (\
+            channel_id  TEXT    PRIMARY KEY, \
+            group_id    TEXT    NOT NULL, \
+            name        TEXT    NOT NULL, \
+            description TEXT, \
+            subscribed  INTEGER NOT NULL DEFAULT 1 \
+        );",
+    )?;
+
+    // Scheduled messages queue.
+    exec(&conn,
+        "CREATE TABLE IF NOT EXISTS scheduled_messages (\
+            id               INTEGER PRIMARY KEY AUTOINCREMENT, \
+            peer_id          TEXT    NOT NULL, \
+            is_group         INTEGER NOT NULL DEFAULT 0, \
+            is_channel       INTEGER NOT NULL DEFAULT 0, \
+            channel_group_id TEXT, \
+            text             TEXT    NOT NULL, \
+            reply_to         TEXT, \
+            mentions         TEXT, \
+            send_at_ms       INTEGER NOT NULL, \
+            status           TEXT    NOT NULL DEFAULT 'pending', \
+            error            TEXT, \
+            created_at       INTEGER NOT NULL \
+        );",
+    )?;
+    exec(&conn,
+        "CREATE INDEX IF NOT EXISTS idx_sched_time ON scheduled_messages(send_at_ms, status);",
+    )?;
+
+    // C3 Link preview cache
+    exec(&conn,
+        "CREATE TABLE IF NOT EXISTS link_previews (\
+            url         TEXT    PRIMARY KEY, \
+            title       TEXT, \
+            description TEXT, \
+            image_url   TEXT, \
+            domain      TEXT    NOT NULL, \
+            fetched_at  INTEGER NOT NULL \
+        );",
+    )?;
+
+    // C15 Performance indexes for retention queries
+    exec(&conn,
+        "CREATE INDEX IF NOT EXISTS idx_messages_peer_ts ON messages(peer_id, ts DESC);",
+    )?;
+    exec(&conn,
+        "CREATE INDEX IF NOT EXISTS idx_group_messages_group_ts ON group_messages(group_id, ts DESC);",
+    )?;
+
+    // C15 Retention column migration (idempotent)
+    let _ = conn.execute(
+        "ALTER TABLE conv_meta ADD COLUMN retention_count INTEGER NOT NULL DEFAULT 0", [],
+    );
+
     Ok(conn)
 }
 
@@ -213,18 +271,19 @@ pub fn insert_received(
     file_size: Option<i64>,
     plain: Option<&str>,
     thumb_data: Option<&[u8]>,
+    mentions: Option<&str>,
 ) -> Result<bool, String> {
     let rows = conn
         .execute(
             "INSERT OR IGNORE INTO messages \
              (peer_id, direction, ts, nonce, ct, status, msg_hash, \
               reply_to_ts, reply_to_from, reply_to_text, \
-              file_id, file_name, file_mime, file_size, plain, thumb_data) \
-             VALUES (?1, 'received', ?2, ?3, ?4, 'delivered', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              file_id, file_name, file_mime, file_size, plain, thumb_data, mentions) \
+             VALUES (?1, 'received', ?2, ?3, ?4, 'delivered', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![peer_id, ts, nonce.as_slice(), ct,
                     wire_hash.map(|h| h.as_slice()),
                     reply_to_ts, reply_to_from, reply_to_text,
-                    file_id, file_name, file_mime, file_size, plain, thumb_data],
+                    file_id, file_name, file_mime, file_size, plain, thumb_data, mentions],
         )
         .map_err(|e| e.to_string())?;
     Ok(rows > 0)
@@ -281,6 +340,7 @@ pub struct RawMessage {
     pub group_id: Option<String>,
     pub sender_id: Option<String>,
     pub thumb_data: Option<Vec<u8>>,
+    pub mentions: Option<String>,
 }
 
 /// Return the highest smid stored for sent messages.
@@ -321,7 +381,7 @@ pub fn load_for_peer(
             "SELECT id, direction, ts, nonce, ct, status, smid, \
                     reply_to_ts, reply_to_from, reply_to_text, \
                     file_id, file_name, file_mime, file_size, \
-                    group_id, sender_id, thumb_data \
+                    group_id, sender_id, thumb_data, mentions \
              FROM messages WHERE peer_id = ?1 AND id < ?2 \
              ORDER BY id DESC LIMIT ?3",
         )
@@ -347,6 +407,7 @@ pub fn load_for_peer(
                 group_id:      row.get(14)?,
                 sender_id:     row.get(15)?,
                 thumb_data:    row.get(16)?,
+                mentions:      row.get(17)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -570,6 +631,7 @@ pub fn insert_group_received(
     file_size: Option<i64>,
     plain: Option<&str>,
     thumb_data: Option<&[u8]>,
+    mentions: Option<&str>,
 ) -> Result<bool, String> {
     let rows = conn
         .execute(
@@ -577,13 +639,13 @@ pub fn insert_group_received(
              (peer_id, direction, ts, nonce, ct, status, msg_hash, \
               reply_to_ts, reply_to_from, reply_to_text, \
               group_id, sender_id, \
-              file_id, file_name, file_mime, file_size, plain, thumb_data) \
-             VALUES (?1, 'received', ?2, ?3, ?4, 'delivered', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+              file_id, file_name, file_mime, file_size, plain, thumb_data, mentions) \
+             VALUES (?1, 'received', ?2, ?3, ?4, 'delivered', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![group_id, ts, nonce.as_slice(), ct,
                     wire_hash.map(|h| h.as_slice()),
                     reply_to_ts, reply_to_from, reply_to_text,
                     group_id, sender_id,
-                    file_id, file_name, file_mime, file_size, plain, thumb_data],
+                    file_id, file_name, file_mime, file_size, plain, thumb_data, mentions],
         )
         .map_err(|e| e.to_string())?;
     Ok(rows > 0)
@@ -853,6 +915,8 @@ pub struct ExportMessage {
     pub plain: String,
     pub sender_id: Option<String>,
     pub group_id: Option<String>,
+    pub file_name: Option<String>,
+    pub file_size: Option<i64>,
 }
 
 #[derive(serde::Serialize)]
@@ -865,7 +929,7 @@ pub struct ExportReaction {
 pub fn load_for_export(conn: &Connection, peer_id: &str) -> (Vec<ExportMessage>, Vec<ExportReaction>) {
     let messages = conn
         .prepare(
-            "SELECT ts, direction, COALESCE(plain, ''), sender_id, group_id \
+            "SELECT ts, direction, COALESCE(plain, ''), sender_id, group_id, file_name, file_size \
              FROM messages WHERE peer_id = ?1 ORDER BY ts ASC",
         )
         .map(|mut s| {
@@ -876,6 +940,8 @@ pub fn load_for_export(conn: &Connection, peer_id: &str) -> (Vec<ExportMessage>,
                     plain:     row.get(2)?,
                     sender_id: row.get(3)?,
                     group_id:  row.get(4)?,
+                    file_name: row.get(5)?,
+                    file_size: row.get(6)?,
                 })
             })
             .map(|it| it.filter_map(|r| r.ok()).collect())
@@ -1081,6 +1147,56 @@ pub fn get_pinned_messages(conn: &Connection, peer_id: &str) -> Vec<PinnedMsg> {
 
 // ── Saved messages ────────────────────────────────────────────────────────────
 
+// ── Channels ──────────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct ChannelRow {
+    pub channel_id:  String,
+    pub group_id:    String,
+    pub name:        String,
+    pub description: Option<String>,
+    pub subscribed:  bool,
+}
+
+pub fn upsert_channel(conn: &Connection, c: &ChannelRow) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO channels (channel_id, group_id, name, description, subscribed) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(channel_id) DO UPDATE SET \
+             name = excluded.name, \
+             description = excluded.description, \
+             subscribed = excluded.subscribed",
+        params![c.channel_id, c.group_id, c.name, c.description, c.subscribed as i32],
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+pub fn get_channels_for_group(conn: &Connection, group_id: &str) -> Vec<ChannelRow> {
+    conn.prepare(
+        "SELECT channel_id, group_id, name, description, subscribed \
+         FROM channels WHERE group_id = ?1 ORDER BY rowid",
+    )
+    .map(|mut s| {
+        s.query_map(params![group_id], |row| {
+            Ok(ChannelRow {
+                channel_id:  row.get(0)?,
+                group_id:    row.get(1)?,
+                name:        row.get(2)?,
+                description: row.get(3)?,
+                subscribed:  row.get::<_, i32>(4)? != 0,
+            })
+        })
+        .map(|it| it.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    })
+    .unwrap_or_default()
+}
+
+pub fn delete_channel(conn: &Connection, channel_id: &str) {
+    let _ = conn.execute("DELETE FROM channels WHERE channel_id = ?1", params![channel_id]);
+}
+
 pub const SAVED_PEER_ID: &str = "__saved__";
 
 pub fn save_note(conn: &Connection, nonce: &[u8; 12], ct: &[u8], plain: &str, ts: i64) {
@@ -1089,6 +1205,221 @@ pub fn save_note(conn: &Connection, nonce: &[u8; 12], ct: &[u8], plain: &str, ts
          VALUES (?1, 'sent', ?2, ?3, ?4, ?5)",
         params![SAVED_PEER_ID, ts, nonce as &[u8], ct, plain],
     );
+}
+
+// ── Scheduled messages ────────────────────────────────────────────────────────
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct ScheduledMsg {
+    pub id:               i64,
+    pub peer_id:          String,
+    pub is_group:         bool,
+    pub is_channel:       bool,
+    pub channel_group_id: Option<String>,
+    pub text:             String,
+    pub reply_to:         Option<String>,
+    pub mentions:         Option<String>,
+    pub send_at_ms:       i64,
+    pub status:           String,
+    pub error:            Option<String>,
+    pub created_at:       i64,
+}
+
+pub fn insert_scheduled(
+    conn: &Connection,
+    peer_id: &str,
+    is_group: bool,
+    is_channel: bool,
+    channel_group_id: Option<&str>,
+    text: &str,
+    reply_to: Option<&str>,
+    mentions: Option<&str>,
+    send_at_ms: i64,
+) -> i64 {
+    let now = crate::store::now_ms();
+    let _ = conn.execute(
+        "INSERT INTO scheduled_messages \
+         (peer_id,is_group,is_channel,channel_group_id,text,reply_to,mentions,send_at_ms,created_at) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![peer_id, is_group as i64, is_channel as i64, channel_group_id,
+                text, reply_to, mentions, send_at_ms, now],
+    );
+    conn.last_insert_rowid()
+}
+
+pub fn get_next_scheduled_time(conn: &Connection) -> Option<i64> {
+    conn.query_row(
+        "SELECT MIN(send_at_ms) FROM scheduled_messages WHERE status='pending'",
+        [],
+        |r| r.get::<_, Option<i64>>(0),
+    ).ok().flatten()
+}
+
+pub fn get_due_scheduled(conn: &Connection, now_ms: i64) -> Vec<ScheduledMsg> {
+    let mut stmt = match conn.prepare(
+        "SELECT id,peer_id,is_group,is_channel,channel_group_id,text,reply_to,mentions,\
+                send_at_ms,status,error,created_at \
+         FROM scheduled_messages WHERE status='pending' AND send_at_ms<=?1 ORDER BY send_at_ms"
+    ) { Ok(s) => s, Err(_) => return vec![] };
+    let x = match stmt.query_map(params![now_ms], row_to_scheduled) {
+        Ok(rows) => rows.flatten().collect(),
+        Err(_) => vec![],
+    }; x
+}
+
+pub fn get_scheduled_by_id(conn: &Connection, id: i64) -> Option<ScheduledMsg> {
+    conn.query_row(
+        "SELECT id,peer_id,is_group,is_channel,channel_group_id,text,reply_to,mentions,\
+                send_at_ms,status,error,created_at \
+         FROM scheduled_messages WHERE id=?1",
+        params![id],
+        row_to_scheduled,
+    ).ok()
+}
+
+pub fn list_scheduled_for_peer(conn: &Connection, peer_id: &str) -> Vec<ScheduledMsg> {
+    let mut stmt = match conn.prepare(
+        "SELECT id,peer_id,is_group,is_channel,channel_group_id,text,reply_to,mentions,\
+                send_at_ms,status,error,created_at \
+         FROM scheduled_messages WHERE status='pending' AND peer_id=?1 ORDER BY send_at_ms"
+    ) { Ok(s) => s, Err(_) => return vec![] };
+    let x = match stmt.query_map(params![peer_id], row_to_scheduled) {
+        Ok(rows) => rows.flatten().collect(),
+        Err(_) => vec![],
+    }; x
+}
+
+pub fn mark_scheduled_sent(conn: &Connection, id: i64) {
+    let _ = conn.execute(
+        "UPDATE scheduled_messages SET status='sent' WHERE id=?1",
+        params![id],
+    );
+}
+
+pub fn mark_scheduled_failed(conn: &Connection, id: i64, error: &str) {
+    let truncated = if error.len() > 500 { &error[..500] } else { error };
+    let _ = conn.execute(
+        "UPDATE scheduled_messages SET status='failed', error=?1 WHERE id=?2",
+        params![truncated, id],
+    );
+}
+
+pub fn set_scheduled_cancelled(conn: &Connection, id: i64) {
+    let _ = conn.execute(
+        "UPDATE scheduled_messages SET status='cancelled' WHERE id=?1",
+        params![id],
+    );
+}
+
+pub fn retry_failed_scheduled(conn: &Connection, grace_ms: i64) {
+    let cutoff = crate::store::now_ms() - grace_ms;
+    let _ = conn.execute(
+        "UPDATE scheduled_messages SET status='pending', error=NULL \
+         WHERE status='failed' AND send_at_ms >= ?1",
+        params![cutoff],
+    );
+}
+
+pub fn cleanup_old_scheduled(conn: &Connection) {
+    let cutoff = crate::store::now_ms() - 7 * 86_400_000;
+    let _ = conn.execute(
+        "DELETE FROM scheduled_messages \
+         WHERE status IN ('sent','cancelled') AND created_at < ?1",
+        params![cutoff],
+    );
+}
+
+fn row_to_scheduled(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledMsg> {
+    Ok(ScheduledMsg {
+        id:               r.get(0)?,
+        peer_id:          r.get(1)?,
+        is_group:         r.get::<_, i64>(2)? != 0,
+        is_channel:       r.get::<_, i64>(3)? != 0,
+        channel_group_id: r.get(4)?,
+        text:             r.get(5)?,
+        reply_to:         r.get(6)?,
+        mentions:         r.get(7)?,
+        send_at_ms:       r.get(8)?,
+        status:           r.get(9)?,
+        error:            r.get(10)?,
+        created_at:       r.get(11)?,
+    })
+}
+
+// ── C3 Link Preview cache ─────────────────────────────────────────────────────
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct LinkPreview {
+    pub url: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub image_url: Option<String>,
+    pub domain: String,
+}
+
+pub fn get_cached_preview(conn: &Connection, url: &str) -> Option<LinkPreview> {
+    let cutoff = crate::store::now_ms() - 86_400_000; // 24 h
+    conn.query_row(
+        "SELECT url,title,description,image_url,domain FROM link_previews WHERE url=?1 AND fetched_at>?2",
+        params![url, cutoff],
+        |r| Ok(LinkPreview {
+            url:         r.get(0)?,
+            title:       r.get(1)?,
+            description: r.get(2)?,
+            image_url:   r.get(3)?,
+            domain:      r.get(4)?,
+        }),
+    ).ok()
+}
+
+pub fn upsert_preview(conn: &Connection, p: &LinkPreview) {
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO link_previews(url,title,description,image_url,domain,fetched_at) \
+         VALUES(?1,?2,?3,?4,?5,?6)",
+        params![p.url, p.title, p.description, p.image_url, p.domain, crate::store::now_ms()],
+    );
+}
+
+// ── C15 Data Retention ────────────────────────────────────────────────────────
+
+pub fn set_retention_count(conn: &Connection, peer_id: &str, count: i64) {
+    let _ = conn.execute(
+        "INSERT INTO conv_meta(peer_id,retention_count) VALUES(?1,?2) \
+         ON CONFLICT(peer_id) DO UPDATE SET retention_count=excluded.retention_count",
+        params![peer_id, count],
+    );
+}
+
+pub fn get_retention_count(conn: &Connection, peer_id: &str) -> i64 {
+    conn.query_row(
+        "SELECT retention_count FROM conv_meta WHERE peer_id=?1",
+        params![peer_id],
+        |r| r.get(0),
+    ).unwrap_or(0)
+}
+
+pub fn enforce_retention_count(conn: &Connection, peer_id: &str, count: i64) {
+    if count <= 0 { return; }
+    let _ = conn.execute(
+        "DELETE FROM messages WHERE peer_id=?1 AND id NOT IN \
+         (SELECT id FROM messages WHERE peer_id=?1 ORDER BY ts DESC LIMIT ?2)",
+        params![peer_id, count],
+    );
+    let _ = conn.execute(
+        "DELETE FROM group_messages WHERE group_id=?1 AND id NOT IN \
+         (SELECT id FROM group_messages WHERE group_id=?1 ORDER BY ts DESC LIMIT ?2)",
+        params![peer_id, count],
+    );
+}
+
+pub fn get_all_retention_peers(conn: &Connection) -> Vec<(String, i64)> {
+    let mut stmt = match conn.prepare(
+        "SELECT peer_id, retention_count FROM conv_meta WHERE retention_count > 0"
+    ) { Ok(s) => s, Err(_) => return vec![] };
+    let x = match stmt.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,i64>(1)?))) {
+        Ok(rows) => rows.flatten().collect(),
+        Err(_) => vec![],
+    }; x
 }
 
 /// Persist the latest verified key log cursor for `user_id`.

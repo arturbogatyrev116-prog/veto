@@ -38,3 +38,7 @@ tauri-plugin-notification = "2"
 tauri-plugin-updater  = "2"
 tauri-plugin-process  = "2"
 tauri-plugin-global-shortcut = "2"
+keyring          = "3"
+hex              = "0.4"
+scraper          = { version = "0.20", default-features = false }
+url              = "2"
