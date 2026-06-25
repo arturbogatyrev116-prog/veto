@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use axum::Router;
+use axum::{Router, extract::DefaultBodyLimit};
 use axum_server::tls_rustls::RustlsConfig;
 use messenger_server::{routes, state::AppState};
 use rcgen::{CertificateParams, DistinguishedName, DnType};
@@ -70,6 +70,7 @@ async fn main() {
 
     let app = Router::new()
         .merge(routes::router(state.clone()))
+        .layer(DefaultBodyLimit::max(20 * 1024 * 1024))
         .nest_service(
             "/admin",
             ServeDir::new(&admin_ui_dir)

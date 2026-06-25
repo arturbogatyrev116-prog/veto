@@ -7,6 +7,8 @@
   import PasswordPrompt from './lib/PasswordPrompt.svelte'
   import Chat from './lib/Chat.svelte'
   import SearchModal from './lib/SearchModal.svelte'
+  import MediaBar from './lib/MediaBar.svelte'
+  import { nowPlaying } from './stores.js'
   import './styles.css'
 
   let decryptErr = ''
@@ -31,6 +33,25 @@
       gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.25)
       osc.start(); osc.stop(ctx.currentTime + 0.25)
     } catch {}
+  }
+
+  function isDndActive() {
+    if (localStorage.getItem('dnd_enabled') !== 'true') return false
+    const from = localStorage.getItem('dnd_from')
+    const to   = localStorage.getItem('dnd_to')
+    if (!from || !to) return true  // enabled but no schedule = always DND
+    const now = new Date()
+    const nowM = now.getHours() * 60 + now.getMinutes()
+    const [fH, fM] = from.split(':').map(Number)
+    const [tH, tM] = to.split(':').map(Number)
+    const fromM = fH * 60 + fM
+    const toM   = tH * 60 + tM
+    // crosses midnight if fromM > toM
+    return fromM <= toM ? (nowM >= fromM && nowM < toM) : (nowM >= fromM || nowM < toM)
+  }
+
+  function notifyIfAllowed() {
+    if (!isDndActive()) playNotify()
   }
 
   // Reconnect with exponential backoff: 1s → 2s → 4s → … → 30s
@@ -64,14 +85,18 @@
 
   onMount(async () => {
     function onKeydown(e) {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-        e.preventDefault()
-        chatRef?.focusSearch?.()
-      }
-      if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
-        e.preventDefault()
-        if ($unlocked) showSearch.set(true)
-      }
+      const ctrl = e.ctrlKey || e.metaKey
+      // Ctrl+K — focus sidebar search
+      if (ctrl && e.key === 'k') { e.preventDefault(); chatRef?.focusSearch?.() }
+      // Ctrl+F — global message search
+      if (ctrl && e.key === 'f') { e.preventDefault(); if ($unlocked) showSearch.set(true) }
+      // Ctrl+N — new chat (focus sidebar input)
+      if (ctrl && e.key === 'n') { e.preventDefault(); chatRef?.focusNewChat?.() }
+      // Ctrl+Tab / Ctrl+Shift+Tab — next / previous conversation
+      if (ctrl && e.key === 'Tab' && !e.shiftKey) { e.preventDefault(); chatRef?.nextConv?.() }
+      if (ctrl && e.key === 'Tab' && e.shiftKey)  { e.preventDefault(); chatRef?.prevConv?.() }
+      // Ctrl+W — close / go to no selection
+      if (ctrl && e.key === 'w') { e.preventDefault(); if ($unlocked) activeConv.set(null) }
     }
     window.addEventListener('keydown', onKeydown)
 
@@ -109,7 +134,7 @@
       if (ac !== gid) {
         unreadCounts.update(c => ({ ...c, [gid]: (c[gid] ?? 0) + 1 }))
       }
-      playNotify()
+      notifyIfAllowed()
     })
 
     const unlistenMsg = await listen('message', ({ payload }) => {
@@ -137,7 +162,7 @@
       } else {
         unreadCounts.update(c => ({ ...c, [from]: (c[from] ?? 0) + 1 }))
       }
-      playNotify()
+      notifyIfAllowed()
     })
 
     const unlistenConn = await listen('connection_lost', () => {
@@ -297,12 +322,16 @@
   </div>
 {/if}
 
-{#if $user && $unlocked}
-  <Chat bind:this={chatRef} />
-{:else if $user}
-  <PasswordPrompt />
-{:else}
-  <Register />
-{/if}
+<MediaBar />
+
+<div class="app-root" class:media-bar-open={$nowPlaying}>
+  {#if $user && $unlocked}
+    <Chat bind:this={chatRef} />
+  {:else if $user}
+    <PasswordPrompt />
+  {:else}
+    <Register />
+  {/if}
+</div>
 
 <SearchModal />

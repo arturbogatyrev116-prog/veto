@@ -3,6 +3,7 @@
   import { listen } from '@tauri-apps/api/event'
   import { tick, onMount, onDestroy } from 'svelte'
   import { marked } from 'marked'
+  import hljs from 'highlight.js'
   import { conversations, activeConv, user, peerNames, typingPeers, addMessage, addGroupMessage, removeMessage, onlinePeers, unlocked, groups, unreadCounts, reactions } from '../stores.js'
   import Avatar from './Avatar.svelte'
   import SafetyNumbers from './SafetyNumbers.svelte'
@@ -203,6 +204,14 @@
   let messagesEl
   let textareaEl
   let showSafetyNumbers = false
+  let dragging = false
+  function onDragOver(e) { e.preventDefault(); dragging = true }
+  function onDragLeave(e) { if (!e.currentTarget.contains(e.relatedTarget)) dragging = false }
+  async function onDrop(e) {
+    e.preventDefault(); dragging = false
+    const files = [...(e.dataTransfer?.files ?? [])]
+    for (const f of files) await sendFile(f)
+  }
   let showScrollBtn = false
   let userScrolledUp = false
   // Reply-to state: { ts, from, peerName, text } | null
@@ -443,6 +452,32 @@
            d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   }
 
+  // ── Pinned messages ──────────────────────────────────────────────────────────
+  let pinnedMsgs = []
+  let showPinnedList = false
+
+  $: if (peerId && $unlocked && loadedPeers.has(peerId)) {
+    invoke('get_pinned_messages', { peerId }).then(p => { pinnedMsgs = p }).catch(() => {})
+  }
+  $: if (peerId) { pinnedMsgs = []; showPinnedList = false }
+
+  async function togglePin(m) {
+    const isPinned = pinnedMsgs.some(p => p.msg_ts === m.ts && p.msg_from === m.from)
+    if (isPinned) {
+      await invoke('unpin_message', { peerId, msgTs: m.ts, msgFrom: m.from })
+      pinnedMsgs = pinnedMsgs.filter(p => !(p.msg_ts === m.ts && p.msg_from === m.from))
+    } else {
+      await invoke('pin_message', { peerId, msgTs: m.ts, msgFrom: m.from, msgText: m.text ?? '' })
+      pinnedMsgs = [...pinnedMsgs, { msg_ts: m.ts, msg_from: m.from, msg_text: m.text ?? '', pinned_at: Date.now() }]
+    }
+    ctxVisible = false
+  }
+
+  function scrollToPinned(pin) {
+    const el = messagesEl?.querySelector(`[data-ts="${pin.msg_ts}"]`)
+    if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); showPinnedList = false }
+  }
+
   // Context menu state
   let ctxVisible = false
   let ctxX = 0, ctxY = 0
@@ -450,7 +485,13 @@
   let ctxMsg = null
   let ctxMine = false
 
-  marked.setOptions({ breaks: true, gfm: true })
+  const renderer = new marked.Renderer()
+  renderer.code = ({ text, lang }) => {
+    const language = lang && hljs.getLanguage(lang) ? lang : 'plaintext'
+    const highlighted = hljs.highlight(text, { language }).value
+    return `<pre><code class="hljs language-${language}">${highlighted}</code></pre>`
+  }
+  marked.setOptions({ breaks: true, gfm: true, renderer })
 
   function renderMd(raw) {
     return marked.parse(raw ?? '')
@@ -460,6 +501,7 @@
   $: peerName = $peerNames[peerId] ?? peerId.slice(0, 8) + '…'
   $: isTyping = !!$typingPeers[peerId]
   $: isGroup = !!$groups[peerId]
+  $: isSaved = peerId === '__saved__'
   $: groupInfo = $groups[peerId] ?? null
 
   // Whether this group uses Sender Keys (O(1) encryption)
@@ -624,7 +666,18 @@
       const replyArg = replyTo
         ? { ts: replyTo.ts, from: replyTo.from, text: replyTo.text }
         : null
-      if (isGroup) {
+      if (isSaved) {
+        const ts = await invoke('save_note', { text: msg })
+        addMessage(peerId, {
+          from: $user.user_id,
+          text: msg,
+          ts,
+          id: null,
+          status: 'sent',
+          reply_to_ts: null, reply_to_from: null, reply_to_text: null,
+          file_id: null, file_key: null, file_name: null, file_mime: null, file_size: null,
+        })
+      } else if (isGroup) {
         await invoke('send_group_message', { groupId: peerId, text: msg, replyTo: replyArg })
         addMessage(peerId, {
           from: $user.user_id,
@@ -657,6 +710,7 @@
       saveDraft(peerId, '')
       await tick()
       scrollBottom()
+      textareaEl?.focus()
     } catch (e) {
       error = String(e)
     } finally {
@@ -723,14 +777,16 @@
   async function stopAndSendVoice(cancel = false) {
     clearInterval(recTicker); recTicker = null; recSeconds = 0
     if (!mediaRecorder) { recState = 'idle'; return }
-    mediaRecorder.stream.getTracks().forEach(t => t.stop())
-    if (cancel || recChunks.length === 0) {
+    if (cancel) {
+      mediaRecorder.stream.getTracks().forEach(t => t.stop())
       mediaRecorder = null; recChunks = []; recState = 'idle'; return
     }
+    // stop() triggers final ondataavailable — must await before checking chunks
     await new Promise(r => { mediaRecorder.onstop = r; mediaRecorder.stop() })
+    mediaRecorder.stream.getTracks().forEach(t => t.stop())
     const blob = new Blob(recChunks, { type: 'audio/webm' })
     mediaRecorder = null; recChunks = []; recState = 'idle'
-    await sendMediaBlob(blob, 'voice.webm', 'audio/webm')
+    if (blob.size > 0) await sendMediaBlob(blob, 'voice.webm', 'audio/webm')
   }
 
   let recSeconds = 0
@@ -897,6 +953,13 @@
     ctxVisible = false
   }
 
+  async function saveToSaved() {
+    if (!ctxMsg) return
+    const text = ctxMsg.text ?? ctxMsg.file_name ?? ''
+    await invoke('save_note', { text }).catch(console.error)
+    ctxVisible = false
+  }
+
   async function deleteForMe() {
     if (!ctxMsg) return
     await invoke('delete_message', { peerId, msgTs: ctxMsg.ts, forAll: false }).catch(console.error)
@@ -921,7 +984,13 @@
 
 <div class="pane">
   <div class="header">
-    {#if isGroup}
+    {#if isSaved}
+      <span class="saved-header-icon">🔖</span>
+      <div class="header-info">
+        <span class="peer-name">Saved Messages</span>
+        <span class="peer-id">Your personal notes</span>
+      </div>
+    {:else if isGroup}
       <span class="group-header-icon">#</span>
       <div class="header-info">
         <span class="peer-name">
@@ -952,8 +1021,8 @@
       >🔒</button>
     {/if}
 
-    <!-- Mute, TTL, Export controls (common to both DM and group) -->
-    <div class="header-extras">
+    <!-- Mute, TTL, Export controls (hidden for Saved Messages) -->
+    <div class="header-extras" class:hidden={isSaved}>
       <!-- Mute button -->
       <div class="popover-wrap">
         <button
@@ -1003,6 +1072,35 @@
     </div>
   </div>
 
+  <!-- Pinned messages banner -->
+  {#if pinnedMsgs.length > 0}
+    <div class="pinned-banner" on:click|stopPropagation={() => {
+      if (pinnedMsgs.length === 1) scrollToPinned(pinnedMsgs[0])
+      else showPinnedList = !showPinnedList
+    }}>
+      <span class="pin-icon">📌</span>
+      <span class="pin-text">
+        {#if pinnedMsgs.length === 1}
+          {pinnedMsgs[0].msg_text || 'Pinned message'}
+        {:else}
+          {pinnedMsgs.length} pinned messages
+        {/if}
+      </span>
+      {#if pinnedMsgs.length > 1}
+        <span class="pin-chevron">{showPinnedList ? '▲' : '▼'}</span>
+      {/if}
+    </div>
+    {#if showPinnedList}
+      <div class="pinned-list">
+        {#each pinnedMsgs as pin}
+          <button class="pinned-list-item" on:click={() => scrollToPinned(pin)}>
+            <span class="pin-item-text">{pin.msg_text || 'Attachment'}</span>
+          </button>
+        {/each}
+      </div>
+    {/if}
+  {/if}
+
   <!-- TTL indicator banner -->
   {#if ttl > 0}
     <div class="ttl-banner">⏱ Messages disappear after {ttl >= 86400 ? ttl/86400 + 'd' : ttl/3600 + 'h'}</div>
@@ -1011,14 +1109,33 @@
     <div class="expiring-banner">⚠ {expiringCount} message{expiringCount > 1 ? 's' : ''} disappear in &lt;1 hour</div>
   {/if}
 
-  <div class="messages-wrap">
+  <div
+    class="messages-wrap"
+    class:drag-over={dragging}
+    on:dragover={onDragOver}
+    on:dragleave={onDragLeave}
+    on:drop={onDrop}
+  >
+  {#if dragging}
+    <div class="drag-overlay">Drop files to send</div>
+  {/if}
   <div class="messages" bind:this={messagesEl} on:scroll={onScroll}>
-    {#if peerMeta[peerId]?.hasMore}
-      <div class="load-more-row">
-        <button class="load-more-btn" on:click={loadMore} disabled={loadingMore}>
-          {loadingMore ? 'Loading…' : 'Load earlier messages'}
-        </button>
+    {#if !loadedPeers.has(peerId)}
+      <div class="skeleton-wrap">
+        {#each [80, 55, 100, 65, 90] as w, i}
+          <div class="skeleton-row" class:skeleton-mine={i % 2 === 0}>
+            <div class="skeleton-bubble" style="width:{w}%"></div>
+          </div>
+        {/each}
       </div>
+    {:else}
+      {#if peerMeta[peerId]?.hasMore}
+        <div class="load-more-row">
+          <button class="load-more-btn" on:click={loadMore} disabled={loadingMore}>
+            {loadingMore ? 'Loading…' : 'Load earlier messages'}
+          </button>
+        </div>
+      {/if}
     {/if}
 
     {#each messages as m, i (m.ts + m.from)}
@@ -1033,7 +1150,7 @@
         : peerName}
       {@const msgKey = `${m.ts}_${m.from}`}
       {@const msgReactions = ($reactions[peerId] ?? {})[msgKey] ?? {}}
-      <div class="msg" class:mine role="listitem" on:contextmenu={e => showCtx(e, m, mine)}>
+      <div class="msg" class:mine role="listitem" data-ts={m.ts} on:contextmenu={e => showCtx(e, m, mine)}>
         {#if !mine}
           <Avatar name={senderName} uid={isGroup ? m.from : peerId} size={24} />
         {/if}
@@ -1055,7 +1172,7 @@
             {/if}
             {#if m.file_id || m.file_name}
               {#if m.file_mime?.startsWith('audio/')}
-                <AudioPlayer msg={m} {downloadFile} {downloadingFiles} />
+                <AudioPlayer msg={m} {downloadFile} {downloadingFiles} peerName={mine ? 'You' : peerName} />
               {:else if m.file_mime?.startsWith('video/')}
                 <VideoPlayer msg={m} {downloadFile} {downloadingFiles} {getThumbnailUrl} {msgKey} />
               {:else if m.file_mime?.startsWith('image/')}
@@ -1157,6 +1274,7 @@
               <div
                 class="reaction-picker"
                 class:mine
+                class:picker-below={i < 3}
                 on:mouseenter={() => keepPicker(msgKey)}
                 on:mouseleave={() => hidePicker(msgKey)}
               >
@@ -1299,13 +1417,23 @@
       on:pointerup={onMicPointerUp}
       on:pointercancel={() => { clearInterval(recTicker); recTicker = null; stopAndSendVoice(true) }}
     >
-      {#if recState === 'voice-locked'}🔒{:else}🎙{/if}
+      {#if recState === 'voice-locked'}
+        🔒
+      {:else}
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M12 1a4 4 0 0 1 4 4v6a4 4 0 0 1-8 0V5a4 4 0 0 1 4-4zm6.5 9a1 1 0 0 1 1 1 7.5 7.5 0 0 1-15 0 1 1 0 1 1 2 0 5.5 5.5 0 0 0 11 0 1 1 0 0 1 1-1zM11 20.93V23a1 1 0 1 0 2 0v-2.07A8.5 8.5 0 0 0 20.47 11a1 1 0 0 0-2 0A6.5 6.5 0 0 1 12 17.5a6.5 6.5 0 0 1-6.47-6.5 1 1 0 0 0-2 0A8.5 8.5 0 0 0 11 20.93z"/>
+        </svg>
+      {/if}
     </button>
     {#if recState === 'voice-locked'}
-      <button type="button" class="rec-stop-btn" on:click={() => { clearInterval(recTicker); recTicker = null; stopAndSendVoice(false) }}>Send</button>
+      <button type="button" class="rec-stop-btn" on:click={() => { clearInterval(recTicker); recTicker = null; stopAndSendVoice(false) }}>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+      </button>
     {/if}
     {#if recState === 'idle'}
-      <button type="submit" disabled={sending || !text.trim()}>Send</button>
+      <button class="send-btn" type="submit" disabled={sending || !text.trim()} title="Send (Enter)">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+      </button>
     {/if}
   </form>
 
@@ -1331,6 +1459,11 @@
     on:keydown|stopPropagation
   >
     <button class="ctx-item" on:click={copyMsg}>Copy</button>
+    <button class="ctx-item" on:click={() => ctxMsg && togglePin(ctxMsg)}>
+      {pinnedMsgs.some(p => p.msg_ts === ctxMsg?.ts && p.msg_from === ctxMsg?.from) ? 'Unpin' : 'Pin'}
+    </button>
+    <button class="ctx-item" on:click={saveToSaved}>Save to Saved</button>
+    <div class="ctx-divider"></div>
     <button class="ctx-item ctx-delete" on:click={deleteForMe}>Delete for me</button>
     {#if ctxMine}
       <button class="ctx-item ctx-delete" on:click={deleteForAll}>Delete for all</button>
@@ -1450,6 +1583,16 @@
     flex-shrink: 0;
   }
   .safety-btn:hover { background: var(--bg-hover); color: var(--text); }
+
+  .saved-header-icon {
+    font-size: 20px;
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
 
   .group-header-icon {
     font-size: 20px;
@@ -1888,6 +2031,10 @@
     z-index: 20;
     white-space: nowrap;
   }
+  .reaction-picker.picker-below {
+    bottom: auto;
+    top: calc(100% + 4px);
+  }
   .reaction-picker.mine { left: auto; right: 0; }
   .reaction-pick-btn {
     background: none;
@@ -1964,6 +2111,7 @@
 
   /* ── Header extras ───────────────────────────────────────────────────────── */
   .header-extras { display: flex; align-items: center; gap: 4px; margin-left: auto; flex-shrink: 0; }
+  .header-extras.hidden { display: none; }
   .icon-hdr-btn {
     background: none; border: none; cursor: pointer;
     color: var(--text-muted); font-size: 14px; padding: 3px 5px; border-radius: 4px;
@@ -2159,4 +2307,126 @@
     font-size: 11px; color: var(--text-dim); flex: 1;
   }
   .locked-hint { color: #a6e3a1; }
+
+  /* ── Pinned messages ─────────────────────────────────────────────────────── */
+  .pinned-banner {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 14px; cursor: pointer;
+    background: var(--bg-hover); border-bottom: 1px solid var(--border);
+    font-size: 13px; color: var(--text);
+    transition: background 0.12s;
+  }
+  .pinned-banner:hover { background: var(--bg-active); }
+  .pin-icon { flex-shrink: 0; }
+  .pin-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: 0.85; }
+  .pin-chevron { font-size: 10px; opacity: 0.6; }
+  .pinned-list {
+    background: var(--bg-panel); border-bottom: 1px solid var(--border);
+    max-height: 160px; overflow-y: auto;
+  }
+  .pinned-list-item {
+    display: block; width: 100%; text-align: left;
+    padding: 7px 14px 7px 34px; font-size: 12px;
+    background: none; color: var(--text);
+    border-bottom: 1px solid var(--border-sub);
+  }
+  .pinned-list-item:hover { background: var(--bg-hover); }
+  .pin-item-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
+
+  .ctx-divider { height: 1px; background: var(--border); margin: 3px 0; }
+
+  /* ── Send button ─────────────────────────────────────────────────────────── */
+  .send-btn {
+    width: 36px; height: 36px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+    transition: background 0.15s, transform 0.1s;
+  }
+  .send-btn:hover:not(:disabled) { background: var(--accent-dim, color-mix(in srgb, var(--accent) 80%, #fff)); }
+  .send-btn:active:not(:disabled) { transform: scale(0.93); }
+  .send-btn:disabled { background: var(--bg-hover); color: var(--text-dim); }
+
+  /* ── Mic button (accent color) ───────────────────────────────────────────── */
+  .mic-btn {
+    color: var(--accent);
+  }
+  .mic-btn.recording { color: #f38ba8; }
+
+  /* ── Drag & drop overlay ─────────────────────────────────────────────────── */
+  .messages-wrap { position: relative; }
+  .drag-over { outline: 2px dashed var(--accent); outline-offset: -4px; }
+  .drag-overlay {
+    position: absolute; inset: 0; z-index: 10;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.45);
+    font-size: 18px; font-weight: 600; color: #fff;
+    border-radius: 6px;
+    pointer-events: none;
+  }
+
+  /* ── Skeleton loader ─────────────────────────────────────────────────────── */
+  .skeleton-wrap { padding: 16px 12px; display: flex; flex-direction: column; gap: 10px; }
+  .skeleton-row { display: flex; }
+  .skeleton-mine { justify-content: flex-end; }
+  .skeleton-bubble {
+    max-width: 60%;
+    height: 36px;
+    border-radius: 12px;
+    background: linear-gradient(90deg, var(--bg-hover) 25%, var(--bg-panel) 50%, var(--bg-hover) 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.4s infinite;
+  }
+  @keyframes shimmer { from { background-position: 200% 0 } to { background-position: -200% 0 } }
+
+  /* ── Syntax highlighting (hljs) ─────────────────────────────────────────── */
+  :global(pre) {
+    margin: 6px 0;
+    border-radius: 6px;
+    overflow-x: auto;
+  }
+  :global(pre code.hljs) {
+    display: block;
+    padding: 12px 14px;
+    font-size: 12px;
+    line-height: 1.5;
+    font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+    border-radius: 6px;
+  }
+  /* Dark theme tokens */
+  :global(.hljs) { background: #1e1e2e; color: #cdd6f4; }
+  :global(.hljs-keyword)    { color: #cba6f7; }
+  :global(.hljs-built_in)   { color: #89dceb; }
+  :global(.hljs-type)       { color: #f9e2af; }
+  :global(.hljs-literal)    { color: #fab387; }
+  :global(.hljs-number)     { color: #fab387; }
+  :global(.hljs-string)     { color: #a6e3a1; }
+  :global(.hljs-comment)    { color: #6c7086; font-style: italic; }
+  :global(.hljs-function)   { color: #89b4fa; }
+  :global(.hljs-title)      { color: #89b4fa; }
+  :global(.hljs-attr)       { color: #89dceb; }
+  :global(.hljs-variable)   { color: #cdd6f4; }
+  :global(.hljs-tag)        { color: #f38ba8; }
+  :global(.hljs-name)       { color: #cba6f7; }
+  :global(.hljs-operator)   { color: #89dceb; }
+  :global(.hljs-punctuation){ color: #cdd6f4; }
+  :global(.hljs-meta)       { color: #f9e2af; }
+  :global(.hljs-section)    { color: #89b4fa; font-weight: bold; }
+  :global(.hljs-selector-class) { color: #fab387; }
+  :global(.hljs-selector-id)    { color: #f38ba8; }
+  :global(.hljs-addition)   { color: #a6e3a1; }
+  :global(.hljs-deletion)   { color: #f38ba8; }
+  /* Light theme overrides */
+  :global([data-theme="light"] .hljs) { background: #f0f0f0; color: #24292e; }
+  :global([data-theme="light"] .hljs-keyword)    { color: #d73a49; }
+  :global([data-theme="light"] .hljs-built_in)   { color: #005cc5; }
+  :global([data-theme="light"] .hljs-string)     { color: #032f62; }
+  :global([data-theme="light"] .hljs-number)     { color: #e36209; }
+  :global([data-theme="light"] .hljs-comment)    { color: #6a737d; }
+  :global([data-theme="light"] .hljs-function)   { color: #6f42c1; }
+  :global([data-theme="light"] .hljs-title)      { color: #6f42c1; }
+  :global([data-theme="light"] .hljs-tag)        { color: #22863a; }
+  :global([data-theme="light"] .hljs-attr)       { color: #005cc5; }
 </style>

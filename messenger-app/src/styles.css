@@ -178,3 +178,7 @@ textarea:focus { border-color: var(--accent); }
 .md-content em { font-style: italic; }
 .md-content a { color: #93c5fd; }
 .md-content ul, .md-content ol { padding-left: 20px; }
+
+/* ── Media bar layout shift ───────────────────────────────────────────────── */
+.app-root { height: 100vh; display: flex; flex-direction: column; }
+.app-root.media-bar-open { padding-top: 44px; height: 100vh; }

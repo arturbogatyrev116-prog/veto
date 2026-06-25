@@ -165,6 +165,7 @@ pub fn run() {
         tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
         Manager, WindowEvent,
     };
+    use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 
     // Priority: env var → AppData config → server_url.txt next to exe → cwd → default
     let server_url = std::env::var("MESSENGER_SERVER_URL").unwrap_or_else(|_| {
@@ -190,6 +191,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(AppState::new(server_url))
         .setup(|app| {
             // Background update-check loop: runs every hour, emits "update_available" if found.
@@ -234,6 +236,26 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+
+            // Global hotkey: Ctrl+Shift+V → show/focus window from anywhere
+            let shortcut = Shortcut::new(
+                Some(Modifiers::CONTROL | Modifiers::SHIFT),
+                Code::KeyM,
+            );
+            let handle = app.handle().clone();
+            if let Err(e) = app.global_shortcut().on_shortcut(shortcut, move |_app, _shortcut, _event| {
+                if let Some(w) = handle.get_webview_window("main") {
+                    if w.is_visible().unwrap_or(false) {
+                        let _ = w.hide();
+                    } else {
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                    }
+                }
+            }) {
+                tracing::warn!("Could not register global shortcut Ctrl+Shift+M: {e}");
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -291,6 +313,13 @@ pub fn run() {
             commands::export_chat,
             commands::get_server_url,
             commands::set_server_url,
+            commands::update_profile,
+            commands::pin_message,
+            commands::unpin_message,
+            commands::get_pinned_messages,
+            commands::save_note,
+            commands::get_chat_stats,
+            commands::set_screen_capture_protection,
             install_update,
         ])
         .run(tauri::generate_context!())

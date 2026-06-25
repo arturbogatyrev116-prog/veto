@@ -11,7 +11,7 @@ pub mod ws;
 
 use axum::{
     middleware,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 
@@ -26,6 +26,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/api/v1/users/{user_id}/prekeys", get(prekeys::fetch))
         .route("/api/v1/users/{user_id}/opks", post(prekeys::upload_opks))
         .route("/api/v1/users/{user_id}/key-log", get(prekeys::get_key_log))
+        .route("/api/v1/users/me", patch(users::patch_me))
         .route("/api/v1/users/by-username/{username}", get(users::by_username))
         .route("/api/v1/files", post(files::upload))
         .route("/api/v1/files/{file_id}", get(files::download))

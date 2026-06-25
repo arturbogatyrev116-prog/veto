@@ -2826,3 +2826,179 @@ pub fn server_url_config_path() -> std::io::Result<std::path::PathBuf> {
             .join("server_url.txt"))
     }
 }
+
+// ── Pinned messages ───────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn pin_message(
+    peer_id: String,
+    msg_ts: i64,
+    msg_from: String,
+    msg_text: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let db = state.db.lock().unwrap();
+    if let Some(conn) = db.as_ref() {
+        db::pin_message(conn, &peer_id, msg_ts, &msg_from, &msg_text, store::now_ms());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn unpin_message(
+    peer_id: String,
+    msg_ts: i64,
+    msg_from: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let db = state.db.lock().unwrap();
+    if let Some(conn) = db.as_ref() {
+        db::unpin_message(conn, &peer_id, msg_ts, &msg_from);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_pinned_messages(
+    peer_id: String,
+    app: AppHandle,
+) -> Result<Vec<db::PinnedMsg>, String> {
+    let state = app.state::<AppState>();
+    let db = state.db.lock().unwrap();
+    Ok(db.as_ref().map(|c| db::get_pinned_messages(c, &peer_id)).unwrap_or_default())
+}
+
+// ── Saved messages ────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct SavedNote {
+    pub ts:   i64,
+    pub text: String,
+}
+
+#[tauri::command]
+pub async fn save_note(text: String, app: AppHandle) -> Result<i64, String> {
+    let state = app.state::<AppState>();
+    let ts = store::now_ms();
+    let key = {
+        let sk = state.session_key.lock().unwrap();
+        sk.clone().ok_or("not unlocked")?
+    };
+    let (nonce, ct) = store::encrypt_content(&text, &key);
+    let db = state.db.lock().unwrap();
+    if let Some(conn) = db.as_ref() {
+        db::save_note(conn, &nonce, &ct, &text, ts);
+    }
+    Ok(ts)
+}
+
+// ── update_profile ────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn update_profile(display_name: String, app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let (server_url, token, user_id) = {
+        let guard = state.identity.lock().unwrap();
+        let id = guard.as_ref().ok_or("not registered")?;
+        (state.server_url.clone(), id.token.clone(), id.user_id.clone())
+    };
+
+    state
+        .http
+        .patch(format!("{}/api/v1/users/me", server_url))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({ "display_name": display_name }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+
+    // Update local display name in peer names cache via event
+    app.emit("profile_updated", serde_json::json!({ "user_id": user_id, "display_name": display_name }))
+        .ok();
+
+    Ok(())
+}
+
+// ── get_chat_stats ────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct PeerStats {
+    pub peer_id: String,
+    pub msg_count: i64,
+    pub sent_count: i64,
+    pub recv_count: i64,
+    pub file_count: i64,
+    pub file_bytes: i64,
+    pub oldest_ts: Option<i64>,
+    pub newest_ts: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ChatStats {
+    pub peers: Vec<PeerStats>,
+    pub total_msgs: i64,
+    pub total_file_bytes: i64,
+    pub db_size_bytes: i64,
+}
+
+#[tauri::command]
+pub fn get_chat_stats(app: AppHandle) -> Result<ChatStats, String> {
+    let state = app.state::<AppState>();
+    let db = state.db.lock().unwrap();
+    let conn = db.as_ref().ok_or("db not open")?;
+
+    // Per-peer stats
+    let mut stmt = conn.prepare(
+        "SELECT peer_id, COUNT(*) as total,
+                SUM(CASE WHEN direction='sent' THEN 1 ELSE 0 END) as sent,
+                SUM(CASE WHEN direction<>'sent' THEN 1 ELSE 0 END) as recv,
+                SUM(CASE WHEN file_id IS NOT NULL THEN 1 ELSE 0 END) as files,
+                COALESCE(SUM(CASE WHEN file_size IS NOT NULL THEN file_size ELSE 0 END), 0) as fbytes,
+                MIN(ts) as oldest, MAX(ts) as newest
+         FROM messages GROUP BY peer_id ORDER BY total DESC",
+    ).map_err(|e| e.to_string())?;
+
+    let peers: Vec<PeerStats> = stmt.query_map([], |row| {
+        Ok(PeerStats {
+            peer_id:    row.get(0)?,
+            msg_count:  row.get(1)?,
+            sent_count: row.get(2)?,
+            recv_count: row.get(3)?,
+            file_count: row.get(4)?,
+            file_bytes: row.get(5)?,
+            oldest_ts:  row.get(6)?,
+            newest_ts:  row.get(7)?,
+        })
+    }).map_err(|e| e.to_string())?
+      .filter_map(|r| r.ok())
+      .collect();
+
+    let total_msgs: i64 = peers.iter().map(|p| p.msg_count).sum();
+    let total_file_bytes: i64 = peers.iter().map(|p| p.file_bytes).sum();
+
+    // SQLite DB file size
+    let db_size_bytes: i64 = conn.query_row(
+        "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+        [], |row| row.get(0)
+    ).unwrap_or(0);
+
+    Ok(ChatStats { peers, total_msgs, total_file_bytes, db_size_bytes })
+}
+
+// ── set_screen_capture_protection ────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn set_screen_capture_protection(
+    enabled: bool,
+    app: AppHandle,
+) -> Result<(), String> {
+    use tauri::Manager;
+    if let Some(window) = app.get_webview_window("main") {
+        window.set_content_protected(enabled).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}

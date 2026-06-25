@@ -10,6 +10,7 @@
   let videoUrl = null
   let loading = false
   let err = false
+  let videoEl
 
   async function load() {
     if (videoUrl || loading || !msg.file_key || !msg.file_id) return
@@ -22,13 +23,29 @@
     finally { loading = false }
   }
 
+  async function enterPip() {
+    if (!videoEl) return
+    try {
+      if (document.pictureInPictureElement === videoEl) {
+        await document.exitPictureInPicture()
+      } else {
+        await videoEl.requestPictureInPicture()
+      }
+    } catch {}
+  }
+
   $: thumbUrl = getThumbnailUrl(msgKey, msg.thumb_data)
 </script>
 
 <div class="circle-wrap">
   {#if videoUrl}
-    <!-- svelte-ignore a11y-media-has-caption -->
-    <video class="circle-video" controls src={videoUrl} poster={thumbUrl ?? undefined}></video>
+    <div class="video-wrap">
+      <!-- svelte-ignore a11y-media-has-caption -->
+      <video class="circle-video" controls src={videoUrl} poster={thumbUrl ?? undefined} bind:this={videoEl}></video>
+      {#if 'pictureInPictureEnabled' in document}
+        <button class="pip-btn" title="Picture-in-Picture" on:click={enterPip}>⧉</button>
+      {/if}
+    </div>
   {:else}
     <button class="circle-thumb" on:click={load} disabled={loading || err} aria-label="Play video">
       {#if thumbUrl}
@@ -64,12 +81,30 @@
   .circle-thumb,
   .circle-img,
   .circle-placeholder {
-    width: 200px;
-    height: 200px;
-    border-radius: 50%;
+    width: 280px;
+    height: 180px;
+    border-radius: 8px;
     object-fit: cover;
     display: block;
   }
+
+  .video-wrap { position: relative; display: inline-block; }
+  .pip-btn {
+    position: absolute;
+    top: 6px; right: 6px;
+    background: rgba(0,0,0,0.55);
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    font-size: 14px;
+    padding: 3px 6px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s;
+    line-height: 1;
+  }
+  .video-wrap:hover .pip-btn { opacity: 1; }
+  .pip-btn:hover { background: rgba(0,0,0,0.8); }
 
   .circle-video { background: #000; }
 
@@ -96,7 +131,7 @@
     color: #fff;
     text-shadow: 0 2px 8px rgba(0,0,0,0.7);
     background: rgba(0,0,0,0.18);
-    border-radius: 50%;
+    border-radius: 8px;
     transition: background 0.15s;
   }
   .circle-thumb:hover:not(:disabled) .circle-play { background: rgba(0,0,0,0.35); }

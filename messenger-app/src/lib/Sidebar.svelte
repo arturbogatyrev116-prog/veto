@@ -3,12 +3,31 @@
   import { conversations, activeConv, user, peerNames, wsStatus, onlinePeers, setPeerName, groups, showSearch, unreadCounts, mutedConvs } from '../stores.js'
   import Avatar from './Avatar.svelte'
   import DeviceManager from './DeviceManager.svelte'
+  import ChatStats from './ChatStats.svelte'
 
   let newPeerId = ''
   let searchQuery = ''
   let error = ''
   let loading = false
   let searchEl
+  let newChatEl
+
+  let showProfileEdit = false
+  let profileDisplayName = ''
+  let profileSaving = false
+  let profileError = ''
+
+  async function saveProfile() {
+    if (!profileDisplayName.trim()) return
+    profileSaving = true; profileError = ''
+    try {
+      await invoke('update_profile', { displayName: profileDisplayName.trim() })
+      showProfileEdit = false
+    } catch (e) {
+      profileError = String(e)
+    } finally {
+      profileSaving = false }
+  }
 
   let loggingOut = false
   async function logout() {
@@ -27,13 +46,31 @@
     }
   }
 
-  // Theme
-  let theme = localStorage.getItem('theme') ?? 'dark'
-  $: {
-    document.documentElement.setAttribute('data-theme', theme === 'light' ? 'light' : '')
-    localStorage.setItem('theme', theme)
+  // Theme: dark → system → light → dark
+  let theme = localStorage.getItem('theme') ?? 'system'
+
+  function applyTheme(t) {
+    const resolved = t === 'system'
+      ? (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')
+      : t
+    document.documentElement.setAttribute('data-theme', resolved === 'light' ? 'light' : '')
+    localStorage.setItem('theme', t)
   }
-  function toggleTheme() { theme = theme === 'dark' ? 'light' : 'dark' }
+
+  $: applyTheme(theme)
+
+  // Follow OS changes when in system mode
+  if (typeof window !== 'undefined') {
+    window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
+      if (theme === 'system') applyTheme('system')
+    })
+  }
+
+  function toggleTheme() {
+    theme = theme === 'dark' ? 'system' : theme === 'system' ? 'light' : 'dark'
+  }
+
+  const themeIcon = { dark: '☀', system: '⊙', light: '☾' }
 
   // Sound (Web Audio API — no file needed)
   function playNotify() {
@@ -76,8 +113,9 @@
     }
   }
 
-  // Expose focus for Ctrl+K
+  // Expose focus for Ctrl+K and Ctrl+N
   export function focusSearch() { searchEl?.focus() }
+  export function focusNewChat() { newChatEl?.focus() }
 
   // ── New group ────────────────────────────────────────────────────────────────
 
@@ -114,6 +152,21 @@
     }
   }
 
+  // ── DND / Focus mode ─────────────────────────────────────────────────────────
+
+  let dndEnabled = localStorage.getItem('dnd_enabled') === 'true'
+  let dndFrom    = localStorage.getItem('dnd_from') ?? '22:00'
+  let dndTo      = localStorage.getItem('dnd_to')   ?? '08:00'
+  let showDnd    = false
+
+  function saveDnd() {
+    localStorage.setItem('dnd_enabled', String(dndEnabled))
+    localStorage.setItem('dnd_from', dndFrom)
+    localStorage.setItem('dnd_to', dndTo)
+  }
+
+  function toggleDnd() { dndEnabled = !dndEnabled; saveDnd() }
+
   // ── Backup / restore ─────────────────────────────────────────────────────────
 
   let backupPassword = ''
@@ -122,6 +175,19 @@
   let showBackup = false
   let showRestore = false
   let showDeviceManager = false
+  let showChatStats = false
+
+  // ── Screen capture protection ─────────────────────────────────────────────────
+  let screenProtected = localStorage.getItem('screen_protected') === 'true'
+
+  async function toggleScreenProtection() {
+    screenProtected = !screenProtected
+    localStorage.setItem('screen_protected', String(screenProtected))
+    try { await invoke('set_screen_capture_protection', { enabled: screenProtected }) } catch {}
+  }
+
+  // Apply on load
+  if (screenProtected) invoke('set_screen_capture_protection', { enabled: true }).catch(() => {})
 
   // Refresh mute status for all visible conversations
   $: {
@@ -171,7 +237,9 @@
 <aside>
   <div class="me">
     <div class="me-info">
-      <Avatar name={$user?.username ?? ''} uid={$user?.user_id ?? ''} size={28} />
+      <button class="avatar-edit-btn" title="Edit profile" on:click={() => { showProfileEdit = !showProfileEdit; profileDisplayName = $user?.username ?? ''; profileError = '' }}>
+        <Avatar name={$user?.username ?? ''} uid={$user?.user_id ?? ''} size={28} />
+      </button>
       <span class="username">@{$user?.username}</span>
     </div>
     <div class="me-actions">
@@ -185,12 +253,36 @@
         {$wsStatus === 'connected' ? '●' : $wsStatus === 'lost' ? '✕' : '↻'}
       </span>
       <button class="icon-btn" on:click={() => showSearch.set(true)} title="Search messages (Ctrl+F)">🔍</button>
-      <button class="icon-btn" on:click={toggleTheme} title="Toggle theme">
-        {theme === 'dark' ? '☀' : '☾'}
+      <button class="icon-btn" on:click={toggleTheme} title="Theme: {theme}">
+        {themeIcon[theme]}
       </button>
+      <button
+        class="icon-btn"
+        class:protected-on={screenProtected}
+        title={screenProtected ? 'Screen protection: ON' : 'Screen protection: OFF'}
+        on:click={toggleScreenProtection}
+      >🛡</button>
       <button class="icon-btn logout-btn" on:click={logout} disabled={loggingOut} title="Sign out">⏻</button>
     </div>
   </div>
+
+  {#if showProfileEdit}
+    <form class="profile-form" on:submit|preventDefault={saveProfile}>
+      <input
+        type="text"
+        bind:value={profileDisplayName}
+        placeholder="Display name"
+        maxlength="64"
+        disabled={profileSaving}
+        autofocus
+      />
+      <button type="submit" disabled={profileSaving || !profileDisplayName.trim()}>
+        {profileSaving ? '…' : 'Save'}
+      </button>
+      <button type="button" on:click={() => showProfileEdit = false}>✕</button>
+      {#if profileError}<p class="err">{profileError}</p>{/if}
+    </form>
+  {/if}
 
   <div class="search-wrap">
     <input
@@ -208,7 +300,8 @@
       <input
         type="text"
         bind:value={newPeerId}
-        placeholder="Username or ID"
+        bind:this={newChatEl}
+        placeholder="Username or ID (Ctrl+N)"
         disabled={loading}
       />
       <button type="submit" disabled={loading || !newPeerId.trim()}>+</button>
@@ -217,6 +310,16 @@
       <p class="err">{error}</p>
     {/if}
   </div>
+
+  <!-- Saved Messages — local-only personal notebook -->
+  <ul class="saved-row">
+    <li class:active={$activeConv === '__saved__'}>
+      <button class="conv-btn" on:click={() => { conversations.update(c => ({ ...c, __saved__: c.__saved__ ?? [] })); activeConv.set('__saved__') }}>
+        <span class="saved-icon">🔖</span>
+        <span class="peer-name">Saved Messages</span>
+      </button>
+    </li>
+  </ul>
 
   <ul>
     {#each filtered as peerId}
@@ -283,9 +386,34 @@
 
   <div class="backup-row">
     <button class="icon-btn" title="Manage devices" on:click={() => showDeviceManager = true}>🖥</button>
+    <button class="icon-btn" title="Chat statistics" on:click={() => showChatStats = true}>📊</button>
     <button class="icon-btn" title="Backup identity" on:click={() => { showBackup = !showBackup; showRestore = false; backupStatus = '' }}>⬇</button>
     <button class="icon-btn" title="Restore identity" on:click={() => { showRestore = !showRestore; showBackup = false; backupStatus = '' }}>⬆</button>
+    <button
+      class="icon-btn"
+      class:dnd-active={dndEnabled}
+      title="Focus / Do Not Disturb"
+      on:click={() => showDnd = !showDnd}
+    >{dndEnabled ? '🔕' : '🌙'}</button>
   </div>
+
+  {#if showDnd}
+    <div class="dnd-panel">
+      <div class="dnd-row">
+        <label class="dnd-toggle">
+          <input type="checkbox" bind:checked={dndEnabled} on:change={saveDnd} />
+          <span>Do Not Disturb</span>
+        </label>
+      </div>
+      {#if dndEnabled}
+        <div class="dnd-row dnd-times">
+          <label>From <input type="time" bind:value={dndFrom} on:change={saveDnd} /></label>
+          <label>To <input type="time" bind:value={dndTo} on:change={saveDnd} /></label>
+        </div>
+        <p class="dnd-hint">Notifications silenced during quiet hours</p>
+      {/if}
+    </div>
+  {/if}
 
   {#if showBackup}
     <form class="backup-form" on:submit|preventDefault={doExport}>
@@ -313,6 +441,10 @@
   <DeviceManager on:close={() => showDeviceManager = false} />
 {/if}
 
+{#if showChatStats}
+  <ChatStats on:close={() => showChatStats = false} />
+{/if}
+
 <style>
   aside {
     width: 220px;
@@ -332,6 +464,14 @@
     align-items: center;
   }
   .me-info { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .avatar-edit-btn { background: none; border: none; padding: 0; cursor: pointer; border-radius: 50%; }
+  .avatar-edit-btn:hover { opacity: 0.8; }
+  .profile-form {
+    display: flex; flex-wrap: wrap; gap: 5px;
+    padding: 6px 10px 8px; border-bottom: 1px solid var(--border);
+  }
+  .profile-form input { flex: 1; min-width: 0; font-size: 12px; padding: 5px 8px; }
+  .profile-form button { font-size: 12px; padding: 5px 8px; }
   .username { font-weight: 600; font-size: 13px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .me-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
   .ws-dot { font-size: 11px; color: var(--text-dim); }
@@ -411,6 +551,8 @@
     border-top: 1px solid var(--border);
   }
   .section-label { font-size: 11px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; }
+  .saved-icon { font-size: 16px; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .saved-row { border-bottom: 1px solid var(--border); }
   .group-icon { font-size: 14px; color: var(--text-dim); width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
   .group-form {
     padding: 6px 10px 8px;
@@ -455,4 +597,20 @@
     .me { justify-content: center; }
     li { justify-content: center; padding: 10px 0; }
   }
+
+  /* ── DND panel ───────────────────────────────────────────────────────────── */
+  .protected-on { color: var(--accent) !important; }
+  .dnd-active { color: var(--accent) !important; }
+  .dnd-panel {
+    padding: 6px 10px 8px;
+    border-top: 1px solid var(--border);
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .dnd-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+  .dnd-toggle { display: flex; align-items: center; gap: 6px; cursor: pointer; color: var(--text); }
+  .dnd-toggle input[type="checkbox"] { cursor: pointer; }
+  .dnd-times { gap: 10px; flex-wrap: wrap; }
+  .dnd-times label { display: flex; align-items: center; gap: 4px; color: var(--text-muted); font-size: 11px; }
+  .dnd-times input[type="time"] { font-size: 11px; padding: 2px 4px; background: var(--bg-hover); border: 1px solid var(--border); color: var(--text); border-radius: 4px; }
+  .dnd-hint { font-size: 10px; color: var(--text-dim); margin: 0; }
 </style>

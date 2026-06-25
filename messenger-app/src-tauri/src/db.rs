@@ -147,6 +147,17 @@ pub fn open(data_dir: &Path) -> Result<Connection, String> {
         );",
     )?;
 
+    exec(&conn,
+        "CREATE TABLE IF NOT EXISTS pinned_messages (\
+            peer_id    TEXT    NOT NULL, \
+            msg_ts     INTEGER NOT NULL, \
+            msg_from   TEXT    NOT NULL, \
+            msg_text   TEXT    NOT NULL DEFAULT '', \
+            pinned_at  INTEGER NOT NULL, \
+            PRIMARY KEY (peer_id, msg_ts, msg_from)\
+        );",
+    )?;
+
     Ok(conn)
 }
 
@@ -1012,6 +1023,72 @@ pub fn get_key_log_state(conn: &Connection, user_id: &str) -> Option<(i64, Vec<u
     )
     .ok()
     .and_then(|(id, hash)| Some((id, hash?)))
+}
+
+// ── Pinned messages ───────────────────────────────────────────────────────────
+
+pub fn pin_message(
+    conn: &Connection,
+    peer_id: &str,
+    msg_ts: i64,
+    msg_from: &str,
+    msg_text: &str,
+    pinned_at: i64,
+) {
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO pinned_messages (peer_id, msg_ts, msg_from, msg_text, pinned_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![peer_id, msg_ts, msg_from, msg_text, pinned_at],
+    );
+}
+
+pub fn unpin_message(conn: &Connection, peer_id: &str, msg_ts: i64, msg_from: &str) {
+    let _ = conn.execute(
+        "DELETE FROM pinned_messages WHERE peer_id=?1 AND msg_ts=?2 AND msg_from=?3",
+        params![peer_id, msg_ts, msg_from],
+    );
+}
+
+#[derive(serde::Serialize)]
+pub struct PinnedMsg {
+    pub msg_ts:   i64,
+    pub msg_from: String,
+    pub msg_text: String,
+    pub pinned_at: i64,
+}
+
+pub fn get_pinned_messages(conn: &Connection, peer_id: &str) -> Vec<PinnedMsg> {
+    let mut stmt = match conn.prepare(
+        "SELECT msg_ts, msg_from, msg_text, pinned_at \
+         FROM pinned_messages WHERE peer_id=?1 ORDER BY pinned_at ASC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    let rows = match stmt.query_map(params![peer_id], |row| {
+        Ok(PinnedMsg {
+            msg_ts:    row.get(0)?,
+            msg_from:  row.get(1)?,
+            msg_text:  row.get(2)?,
+            pinned_at: row.get(3)?,
+        })
+    }) {
+        Ok(r) => r,
+        Err(_) => return vec![],
+    };
+    rows.flatten().collect()
+}
+
+// ── Saved messages ────────────────────────────────────────────────────────────
+
+pub const SAVED_PEER_ID: &str = "__saved__";
+
+pub fn save_note(conn: &Connection, nonce: &[u8; 12], ct: &[u8], plain: &str, ts: i64) {
+    let _ = conn.execute(
+        "INSERT INTO messages (peer_id, direction, ts, nonce, ct, plain) \
+         VALUES (?1, 'sent', ?2, ?3, ?4, ?5)",
+        params![SAVED_PEER_ID, ts, nonce as &[u8], ct, plain],
+    );
 }
 
 /// Persist the latest verified key log cursor for `user_id`.

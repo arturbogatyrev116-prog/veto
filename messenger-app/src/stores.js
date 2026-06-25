@@ -68,3 +68,24 @@ export const reactions = writable({})
 
 // { [peer_id]: boolean } — true when chat is muted; polled lazily by Sidebar
 export const mutedConvs = writable({})
+
+// Currently playing media: { el: HTMLAudioElement, title: string, peerName: string, ts: number } | null
+// Only one audio plays at a time; setting a new one stops the previous.
+export const nowPlaying = writable(null)
+
+export function playAudio(el, meta) {
+  // Stop whatever is playing now
+  let prev
+  nowPlaying.subscribe(v => { prev = v })()
+  if (prev && prev.el !== el) {
+    prev.el.pause()
+  }
+  nowPlaying.set({ el, ...meta })
+}
+
+export function stopAudio() {
+  let prev
+  nowPlaying.subscribe(v => { prev = v })()
+  if (prev) { prev.el.pause() }
+  nowPlaying.set(null)
+}
