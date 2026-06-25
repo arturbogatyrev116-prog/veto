@@ -9,6 +9,8 @@ use uuid::Uuid;
 
 use crate::{auth::AuthUser, error::AppError, state::AppState};
 
+type PollRow = (String, String, String, String, serde_json::Value, bool, chrono::DateTime<chrono::Utc>);
+
 #[derive(Deserialize)]
 pub struct CreatePollReq {
     pub peer_id: String,
@@ -159,7 +161,7 @@ pub async fn close(
 }
 
 async fn build_poll_resp(state: &AppState, poll_id: Uuid, user_id: Uuid) -> Result<PollResp, AppError> {
-    let row: Option<(String, String, String, String, serde_json::Value, bool, chrono::DateTime<chrono::Utc>)> =
+    let row: Option<PollRow> =
         sqlx::query_as(
             "SELECT id::text, peer_id, creator_id::text, question, options, closed, created_at FROM polls WHERE id = $1"
         )

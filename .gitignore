@@ -31,6 +31,9 @@ messenger_research_2026*.md
 *.AppImage
 *.ico
 *.icns
+# Exception: Tauri app icons (source assets, not build artifacts)
+!messenger-app/src-tauri/icons/icon.ico
+!messenger-app/src-tauri/icons/icon.icns
 
 # Runtime (server-side only)
 monitor/monitor.log
