@@ -4,6 +4,7 @@
   import Avatar from './Avatar.svelte'
   import DeviceManager from './DeviceManager.svelte'
   import ChatStats from './ChatStats.svelte'
+  import SettingsModal from './SettingsModal.svelte'
 
   export let collapsed = false
 
@@ -48,31 +49,43 @@
     }
   }
 
-  // Theme: dark → system → light → dark
-  let theme = localStorage.getItem('theme') ?? 'system'
+  // ── Appearance ────────────────────────────────────────────────────────────
+  let theme  = localStorage.getItem('theme')  ?? 'system'
+  let accent = localStorage.getItem('accent') ?? 'blue'
+  let showThemeMenu = false
 
-  function applyTheme(t) {
+  const ACCENTS = {
+    blue:   { label: 'Blue',   hex: '#3b82f6', accentH: '#2563eb', dark: '#1d4ed8', light: '#3b82f6', bgActD: '#1d3a5f', bgActL: '#dbeafe' },
+    purple: { label: 'Purple', hex: '#8b5cf6', accentH: '#7c3aed', dark: '#5b21b6', light: '#8b5cf6', bgActD: '#2e1065', bgActL: '#ede9fe' },
+    green:  { label: 'Green',  hex: '#22c55e', accentH: '#16a34a', dark: '#15803d', light: '#22c55e', bgActD: '#052e16', bgActL: '#dcfce7' },
+    pink:   { label: 'Pink',   hex: '#ec4899', accentH: '#db2777', dark: '#9d174d', light: '#ec4899', bgActD: '#500724', bgActL: '#fce7f3' },
+    orange: { label: 'Orange', hex: '#f97316', accentH: '#ea580c', dark: '#9a3412', light: '#f97316', bgActD: '#431407', bgActL: '#ffedd5' },
+    teal:   { label: 'Teal',   hex: '#14b8a6', accentH: '#0d9488', dark: '#0f766e', light: '#14b8a6', bgActD: '#042f2e', bgActL: '#ccfbf1' },
+  }
+
+  function applyAppearance(t, a) {
     const resolved = t === 'system'
       ? (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')
       : t
-    document.documentElement.setAttribute('data-theme', resolved === 'light' ? 'light' : '')
+    const isLight = resolved === 'light'
+    document.documentElement.setAttribute('data-theme', isLight ? 'light' : '')
     localStorage.setItem('theme', t)
+    const p = ACCENTS[a] ?? ACCENTS.blue
+    const root = document.documentElement
+    root.style.setProperty('--accent',      p.hex)
+    root.style.setProperty('--accent-h',    p.accentH)
+    root.style.setProperty('--bg-msg-out',  isLight ? p.light  : p.dark)
+    root.style.setProperty('--bg-active',   isLight ? p.bgActL : p.bgActD)
+    localStorage.setItem('accent', a)
   }
 
-  $: applyTheme(theme)
+  $: applyAppearance(theme, accent)
 
-  // Follow OS changes when in system mode
   if (typeof window !== 'undefined') {
     window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
-      if (theme === 'system') applyTheme('system')
+      if (theme === 'system') applyAppearance('system', accent)
     })
   }
-
-  function toggleTheme() {
-    theme = theme === 'dark' ? 'system' : theme === 'system' ? 'light' : 'dark'
-  }
-
-  const themeIcon = { dark: '☀', system: '⊙', light: '☾' }
 
   // Sound (Web Audio API — no file needed)
   function playNotify() {
@@ -90,12 +103,19 @@
 
   export { playNotify }
 
+  let folder = 'all'   // 'all' | 'dms' | 'groups'
+
   // Filtered conversations
   $: filtered = Object.keys($conversations).filter(pid => {
+    if (pid === '__saved__') return false
+    if ($groups[pid]) return false
     if (!searchQuery) return true
     const name = ($peerNames[pid] ?? pid).toLowerCase()
     return name.includes(searchQuery.toLowerCase())
   })
+
+  $: dmUnread    = filtered.reduce((s, pid) => s + ($unreadCounts[pid] ?? 0), 0)
+  $: groupUnread = Object.keys($groups).reduce((s, gid) => s + ($unreadCounts[gid] ?? 0), 0)
 
   async function startChat() {
     const peerId = newPeerId.trim()
@@ -228,6 +248,7 @@
   let showRestore = false
   let showDeviceManager = false
   let showChatStats = false
+  let showSettings = false
 
   // ── Screen capture protection ─────────────────────────────────────────────────
   let screenProtected = localStorage.getItem('screen_protected') === 'true'
@@ -238,8 +259,8 @@
     try { await invoke('set_screen_capture_protection', { enabled: screenProtected }) } catch {}
   }
 
-  // Apply on load
-  if (screenProtected) invoke('set_screen_capture_protection', { enabled: true }).catch(() => {})
+  // Apply screen protection reactively (also covers on-load)
+  $: invoke('set_screen_capture_protection', { enabled: screenProtected }).catch(() => {})
 
   // Refresh mute status for all visible conversations
   $: {
@@ -286,6 +307,11 @@
   }
 </script>
 
+<svelte:window
+  on:click={() => showThemeMenu = false}
+  on:keydown={e => e.key === 'Escape' && (showThemeMenu = false)}
+/>
+
 <aside class:collapsed>
   <div class="me">
     <div class="me-info">
@@ -305,21 +331,45 @@
         {$wsStatus === 'connected' ? '●' : $wsStatus === 'lost' ? '✕' : '↻'}
       </span>
       <button class="icon-btn" on:click={() => showSearch.set(true)} title="Search messages (Ctrl+F)">🔍</button>
-      <button class="icon-btn" on:click={toggleTheme} title="Theme: {theme}">
-        {themeIcon[theme]}
-      </button>
-      <button
-        class="icon-btn"
-        class:protected-on={screenProtected}
-        title={screenProtected ? 'Screen protection: ON' : 'Screen protection: OFF'}
-        on:click={toggleScreenProtection}
-      >🛡</button>
+      <div class="theme-wrap">
+        <button class="icon-btn" aria-label="Theme and accent colors" title="Theme & colors" on:click|stopPropagation={() => showThemeMenu = !showThemeMenu}>🎨</button>
+        {#if showThemeMenu}
+          <div class="theme-menu" role="menu" tabindex="0" on:click|stopPropagation on:keydown|stopPropagation>
+            <div class="tm-section">
+              <div class="tm-label">Theme</div>
+              <div class="tm-pills">
+                <button class="tm-pill" class:selected={theme === 'dark'}   on:mousedown|preventDefault on:click={() => theme = 'dark'}>Dark</button>
+                <button class="tm-pill" class:selected={theme === 'system'} on:mousedown|preventDefault on:click={() => theme = 'system'}>Auto</button>
+                <button class="tm-pill" class:selected={theme === 'light'}  on:mousedown|preventDefault on:click={() => theme = 'light'}>Light</button>
+              </div>
+            </div>
+            <div class="tm-section">
+              <div class="tm-label">Accent</div>
+              <div class="accent-swatches">
+                {#each Object.entries(ACCENTS) as [key, p]}
+                  <button
+                    class="accent-swatch"
+                    class:selected={accent === key}
+                    style="background:{p.hex}"
+                    aria-label={p.label}
+                    title={p.label}
+                    on:mousedown|preventDefault
+                    on:click={() => accent = key}
+                  ></button>
+                {/each}
+              </div>
+            </div>
+          </div>
+        {/if}
+      </div>
+      <button class="icon-btn" title="Settings" aria-label="Settings" on:click={() => showSettings = true}>⚙</button>
       <button class="icon-btn logout-btn" on:click={logout} disabled={loggingOut} title="Sign out">⏻</button>
     </div>
   </div>
 
   {#if showProfileEdit}
     <form class="profile-form" on:submit|preventDefault={saveProfile}>
+      <!-- svelte-ignore a11y-autofocus -->
       <input
         type="text"
         bind:value={profileDisplayName}
@@ -363,6 +413,27 @@
     {/if}
   </div>
 
+  <div class="folder-tabs">
+    <button class="ftab" class:active={folder === 'all'} on:click={() => folder = 'all'}>
+      All
+      {#if folder !== 'all' && dmUnread + groupUnread > 0}
+        <span class="ftab-badge">{Math.min(dmUnread + groupUnread, 99)}</span>
+      {/if}
+    </button>
+    <button class="ftab" class:active={folder === 'dms'} on:click={() => folder = 'dms'}>
+      DMs
+      {#if folder !== 'dms' && dmUnread > 0}
+        <span class="ftab-badge">{Math.min(dmUnread, 99)}</span>
+      {/if}
+    </button>
+    <button class="ftab" class:active={folder === 'groups'} on:click={() => folder = 'groups'}>
+      Groups
+      {#if folder !== 'groups' && groupUnread > 0}
+        <span class="ftab-badge">{Math.min(groupUnread, 99)}</span>
+      {/if}
+    </button>
+  </div>
+
   <!-- Saved Messages — local-only personal notebook -->
   <ul class="saved-row">
     <li class:active={$activeConv === '__saved__'}>
@@ -373,29 +444,35 @@
     </li>
   </ul>
 
-  <ul>
-    {#each filtered as peerId}
-      {@const name = $peerNames[peerId] ?? peerId.slice(0, 8) + '…'}
-      {@const unread = $unreadCounts[peerId] ?? 0}
-      <li class:active={$activeConv === peerId}>
-        <button class="conv-btn" on:click={() => activeConv.set(peerId)}>
-          <div class="avatar-wrap">
-            <Avatar {name} uid={peerId} size={32} />
-            {#if $onlinePeers.has(peerId)}
-              <span class="online-dot" title="Online"></span>
+  {#if folder === 'all' || folder === 'dms'}
+    <ul>
+      {#each filtered as peerId}
+        {@const name = $peerNames[peerId] ?? peerId.slice(0, 8) + '…'}
+        {@const unread = $unreadCounts[peerId] ?? 0}
+        <li class:active={$activeConv === peerId}>
+          <button class="conv-btn" on:click={() => activeConv.set(peerId)}>
+            <div class="avatar-wrap">
+              <Avatar {name} uid={peerId} size={32} />
+              {#if $onlinePeers.has(peerId)}
+                <span class="online-dot" title="Online"></span>
+              {/if}
+            </div>
+            <span class="peer-name" class:bold={unread > 0}>{name}</span>
+            {#if $mutedConvs[peerId]}
+              <span class="muted-icon" title="Muted">🔕</span>
+            {:else if unread > 0}
+              <span class="badge">{unread > 99 ? '99+' : unread}</span>
             {/if}
-          </div>
-          <span class="peer-name" class:bold={unread > 0}>{name}</span>
-          {#if $mutedConvs[peerId]}
-            <span class="muted-icon" title="Muted">🔕</span>
-          {:else if unread > 0}
-            <span class="badge">{unread > 99 ? '99+' : unread}</span>
-          {/if}
-        </button>
-      </li>
-    {/each}
-  </ul>
+          </button>
+        </li>
+      {/each}
+      {#if filtered.length === 0 && folder === 'dms'}
+        <li class="folder-empty">No DMs yet — start one above</li>
+      {/if}
+    </ul>
+  {/if}
 
+  {#if folder === 'all' || folder === 'groups'}
   {#if Object.keys($groups).length > 0 || showNewGroup}
     <div class="section-header">
       <span class="section-label">Groups</span>
@@ -415,7 +492,7 @@
             {:else if unread > 0}
               <span class="badge">{unread > 99 ? '99+' : unread}</span>
             {/if}
-            {#if groupChannels.length > 0}
+            {#if groupChannels.length > 0 || canManageChannels(g.group_id)}
               <button
                 class="expand-btn"
                 title={expanded ? 'Hide channels' : 'Show channels'}
@@ -425,7 +502,7 @@
           </button>
         </li>
 
-        {#if expanded && groupChannels.length > 0}
+        {#if expanded}
           <li class="channel-list">
             {#each groupChannels as ch}
               {@const chanPeerId = `${g.group_id}/${ch.channel_id}`}
@@ -483,6 +560,7 @@
       </div>
       {#if groupError}<p class="err">{groupError}</p>{/if}
     </form>
+  {/if}
   {/if}
 
   <div class="backup-row">
@@ -546,14 +624,28 @@
   <ChatStats on:close={() => showChatStats = false} />
 {/if}
 
+{#if showSettings}
+  <SettingsModal
+    bind:theme
+    bind:accent
+    bind:dndEnabled
+    bind:dndFrom
+    bind:dndTo
+    bind:screenProtected
+    onClose={() => showSettings = false}
+  />
+{/if}
+
 <style>
   aside {
     width: 220px;
+    height: 100%;
     border-right: 1px solid var(--border);
     display: flex;
     flex-direction: column;
     background: var(--bg-panel);
     flex-shrink: 0;
+    overflow: hidden;
     transition: width 0.2s;
   }
 
@@ -727,13 +819,110 @@
   }
   .backup-err { color: var(--danger); font-size: 11px; padding: 0 10px 6px; }
 
+  /* ── Theme popover ──────────────────────────────────────────────────────── */
+  .theme-wrap { position: relative; }
+  .theme-menu {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    right: 0;
+    z-index: 200;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    padding: 10px 12px;
+    min-width: 184px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .tm-section { display: flex; flex-direction: column; gap: 6px; }
+  .tm-label { font-size: 10px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; }
+  .tm-pills { display: flex; gap: 4px; }
+  .tm-pill {
+    flex: 1;
+    background: var(--bg-hover);
+    color: var(--text-muted);
+    font-size: 11px;
+    padding: 4px 6px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s;
+  }
+  .tm-pill:hover { background: var(--bg-hover); color: var(--text); }
+  .tm-pill.selected { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .accent-swatches { display: flex; gap: 6px; flex-wrap: wrap; }
+  .accent-swatch {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    border: 2px solid transparent;
+    padding: 0;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: transform 0.12s, border-color 0.12s;
+    outline-offset: 2px;
+  }
+  .accent-swatch:hover { transform: scale(1.18); }
+  .accent-swatch.selected { border-color: var(--text); transform: scale(1.18); }
+
+  /* ── Folder tabs ────────────────────────────────────────────────────────── */
+  .folder-tabs {
+    display: flex;
+    gap: 3px;
+    padding: 5px 8px 6px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .ftab {
+    flex: 1;
+    background: none;
+    color: var(--text-dim);
+    font-size: 12px;
+    padding: 4px 4px;
+    border-radius: 6px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    transition: background 0.12s, color 0.12s;
+    border: none;
+  }
+  .ftab:hover { background: var(--bg-hover); color: var(--text-muted); }
+  .ftab.active { background: var(--bg-active); color: var(--accent); font-weight: 600; }
+  .ftab-badge {
+    font-size: 9px;
+    font-weight: 700;
+    color: #fff;
+    background: var(--accent);
+    border-radius: 999px;
+    padding: 0 4px;
+    min-width: 14px;
+    height: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+  }
+  .folder-empty {
+    padding: 20px 12px;
+    font-size: 12px;
+    color: var(--text-dim);
+    text-align: center;
+    list-style: none;
+    border-bottom: none;
+  }
+  .folder-empty:hover { background: none; }
+
   /* Icons-only collapsed mode (controlled by parent Chat.svelte) */
   aside.collapsed { width: 56px; }
   aside.collapsed .username,
   aside.collapsed .peer-name,
-  aside.collapsed .count,
   aside.collapsed .search-wrap,
   aside.collapsed .new-chat,
+  aside.collapsed .folder-tabs,
   aside.collapsed .ws-dot,
   aside.collapsed .section-header,
   aside.collapsed .saved-row span,

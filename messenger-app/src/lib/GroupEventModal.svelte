@@ -54,11 +54,13 @@
   }
 </script>
 
+<!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
 <div class="modal-overlay" role="dialog" aria-modal="true" on:click|self={() => dispatch('close')}>
   <div class="modal-box">
     <div class="modal-title">📅 Create Event</div>
 
     <label class="field-label">Title *
+      <!-- svelte-ignore a11y-autofocus -->
       <input class="modal-input" type="text" bind:value={title} placeholder="Event name" maxlength="100" autofocus />
     </label>
 

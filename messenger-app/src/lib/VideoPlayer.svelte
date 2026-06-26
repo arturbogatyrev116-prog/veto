@@ -75,13 +75,14 @@
 </div>
 
 <style>
-  .circle-wrap { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; padding: 2px 0; }
+  .circle-wrap { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; padding: 2px 0; max-width: 100%; }
 
   .circle-video,
   .circle-thumb,
   .circle-img,
   .circle-placeholder {
     width: 280px;
+    max-width: 100%;
     height: 180px;
     border-radius: 8px;
     object-fit: cover;

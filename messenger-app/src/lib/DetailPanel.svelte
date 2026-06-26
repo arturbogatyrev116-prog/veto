@@ -17,9 +17,10 @@
     ? 'Saved Messages'
     : peerId
 
-  // Collect media and links from messages
+  // Collect media, links and files from messages
   $: messages = $conversations[peerId] ?? []
   $: mediaMessages = messages.filter(m => m.file_mime?.startsWith('image/') || m.file_mime?.startsWith('video/'))
+  $: filesMessages = messages.filter(m => m.file_mime && !m.file_mime.startsWith('image/') && !m.file_mime.startsWith('video/'))
   $: linkMessages = (() => {
     const urlRe = /https?:\/\/[^\s<>"]+/gi
     const seen = new Set()
@@ -110,11 +111,37 @@
   function formatDate(ts) {
     return new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
   }
+
+  function formatFileSize(bytes) {
+    if (!bytes) return ''
+    if (bytes < 1024) return `${bytes} B`
+    if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`
+    return `${(bytes / 1048576).toFixed(1)} MB`
+  }
+
+  function fileIcon(mime) {
+    if (!mime) return '📎'
+    if (mime.startsWith('audio/')) return '🎵'
+    if (mime.includes('pdf')) return '📋'
+    if (mime.startsWith('text/')) return '📄'
+    if (mime.includes('zip') || mime.includes('rar') || mime.includes('7z') || mime.includes('tar') || mime.includes('gz')) return '📦'
+    if (mime.includes('word') || mime.includes('document') || mime.includes('odt')) return '📝'
+    if (mime.includes('sheet') || mime.includes('excel') || mime.includes('ods')) return '📊'
+    if (mime.includes('presentation') || mime.includes('powerpoint') || mime.includes('odp')) return '📑'
+    return '📎'
+  }
 </script>
 
 <div class="detail-panel">
   <div class="detail-header">
-    <span class="detail-title">Info</span>
+    <div class="detail-header-info">
+      {#if isGroup}
+        <div class="header-group-avatar">#</div>
+      {:else}
+        <Avatar name={peerName} uid={peerId} size={26} />
+      {/if}
+      <span class="detail-title">{peerName}</span>
+    </div>
     <button class="close-btn" on:click={onClose} aria-label="Close panel">✕</button>
   </div>
 
@@ -123,8 +150,9 @@
     <button role="tab" class:active={tab === 'info'}    on:click={() => tab = 'info'}>Info</button>
     <button role="tab" class:active={tab === 'media'}   on:click={() => tab = 'media'}>Media</button>
     <button role="tab" class:active={tab === 'links'}   on:click={() => tab = 'links'}>Links</button>
+    <button role="tab" class:active={tab === 'files'}   on:click={() => tab = 'files'}>Files</button>
     {#if isGroup}
-      <button role="tab" class:active={tab === 'members'} on:click={() => tab = 'members'}>Members</button>
+      <button role="tab" class:active={tab === 'members'} on:click={() => tab = 'members'}>People</button>
     {/if}
   </div>
 
@@ -148,17 +176,17 @@
         {/if}
 
         <div class="info-stats">
-          <div class="stat-item">
-            <span class="stat-val">{messages.length}</span>
-            <span class="stat-lbl">Messages</span>
-          </div>
-          <div class="stat-item">
+          <div class="stat-item" role="button" tabindex="0" on:click={() => tab = 'media'} on:keydown={e => (e.key === 'Enter' || e.key === ' ') && (tab = 'media')}>
             <span class="stat-val">{mediaMessages.length}</span>
             <span class="stat-lbl">Media</span>
           </div>
-          <div class="stat-item">
+          <div class="stat-item" role="button" tabindex="0" on:click={() => tab = 'links'} on:keydown={e => (e.key === 'Enter' || e.key === ' ') && (tab = 'links')}>
             <span class="stat-val">{linkMessages.length}</span>
             <span class="stat-lbl">Links</span>
+          </div>
+          <div class="stat-item" role="button" tabindex="0" on:click={() => tab = 'files'} on:keydown={e => (e.key === 'Enter' || e.key === ' ') && (tab = 'files')}>
+            <span class="stat-val">{filesMessages.length}</span>
+            <span class="stat-lbl">Files</span>
           </div>
         </div>
 
@@ -201,6 +229,26 @@
             <li class="link-item">
               <a href={l.url} target="_blank" rel="noopener noreferrer" class="link-url">{l.url}</a>
               <span class="link-date">{formatDate(l.ts)}</span>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+
+    <!-- ── Files tab ── -->
+    {:else if tab === 'files'}
+      {#if filesMessages.length === 0}
+        <div class="empty-tab">No files yet</div>
+      {:else}
+        <ul class="file-list">
+          {#each filesMessages as m (m.ts)}
+            <li class="file-item">
+              <span class="file-icon-col">{fileIcon(m.file_mime)}</span>
+              <div class="file-info">
+                <div class="file-fname">{m.file_name ?? m.file_mime ?? 'file'}</div>
+                <div class="file-meta">
+                  {#if m.file_size}{formatFileSize(m.file_size)} · {/if}{formatDate(m.ts)}
+                </div>
+              </div>
             </li>
           {/each}
         </ul>
@@ -278,10 +326,32 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 12px 14px;
+    padding: 10px 12px;
     border-bottom: 1px solid var(--border);
+    gap: 8px;
   }
-  .detail-title { font-weight: 600; font-size: 14px; color: var(--text); }
+  .detail-header-info {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    flex: 1;
+  }
+  .header-group-avatar {
+    width: 26px; height: 26px; border-radius: 50%;
+    background: var(--bg-hover);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; color: var(--text-dim);
+    flex-shrink: 0;
+  }
+  .detail-title {
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .close-btn {
     background: none;
     color: var(--text-muted);
@@ -334,11 +404,16 @@
   .info-sub { font-size: 12px; color: var(--text-dim); font-family: monospace; }
 
   .info-stats {
-    display: flex; gap: 16px; margin: 12px 0 4px;
+    display: flex; gap: 4px; margin: 12px 0 4px;
     background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
-    padding: 10px 14px; width: 100%; justify-content: space-around;
+    padding: 10px 6px; width: 100%; justify-content: space-around;
   }
-  .stat-item { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+  .stat-item {
+    display: flex; flex-direction: column; align-items: center; gap: 2px;
+    flex: 1; border-radius: 6px; padding: 4px 2px; cursor: pointer;
+    transition: background 0.12s;
+  }
+  .stat-item:hover { background: var(--bg-hover); }
   .stat-val { font-weight: 700; font-size: 18px; color: var(--text); }
   .stat-lbl { font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.04em; }
 
@@ -436,6 +511,22 @@
   }
   .member-ctx-menu button:hover { background: var(--bg-hover); }
   .member-ctx-menu button.danger { color: var(--danger); }
+
+  /* ── Files tab ── */
+  .file-list { list-style: none; display: flex; flex-direction: column; gap: 4px; }
+  .file-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 8px;
+    border-radius: 8px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    transition: background 0.1s;
+  }
+  .file-item:hover { background: var(--bg-hover); }
+  .file-icon-col { font-size: 20px; flex-shrink: 0; line-height: 1; }
+  .file-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .file-fname { font-size: 12px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-meta { font-size: 10px; color: var(--text-dim); }
 
   /* ── Empty state ── */
   .empty-tab {

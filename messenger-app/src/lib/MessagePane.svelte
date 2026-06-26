@@ -4,7 +4,7 @@
   import { tick, onMount, onDestroy } from 'svelte'
   import { marked } from 'marked'
   import hljs from 'highlight.js'
-  import { conversations, activeConv, user, peerNames, typingPeers, addMessage, addGroupMessage, removeMessage, onlinePeers, unlocked, groups, unreadCounts, reactions, showSearch, channels } from '../stores.js'
+  import { conversations, activeConv, user, peerNames, typingPeers, addMessage, addGroupMessage, removeMessage, onlinePeers, unlocked, groups, unreadCounts, reactions, showSearch, channels, chatBg, CHAT_GRADIENTS } from '../stores.js'
   import Avatar from './Avatar.svelte'
   import SafetyNumbers from './SafetyNumbers.svelte'
   import AudioPlayer from './AudioPlayer.svelte'
@@ -48,14 +48,14 @@
   // ── Mute settings ──────────────────────────────────────────────────────────
 
   let muteSettings = { notifications_enabled: true, mute_until: 0, is_muted: false }
-  let showMuteMenu = false
+  let showMoreMenu = false
 
   $: if (peerId && $unlocked) {
     invoke('get_mute', { peerId }).then(s => { muteSettings = s }).catch(() => {})
   }
 
   async function setMute(hours) {
-    showMuteMenu = false
+    showMoreMenu = false
     await invoke('set_mute', { peerId, muteHours: hours }).catch(() => {})
     muteSettings = await invoke('get_mute', { peerId }).catch(() => muteSettings)
   }
@@ -63,7 +63,6 @@
   // ── TTL (disappearing messages) ────────────────────────────────────────────
 
   let ttl = 0
-  let showTtlMenu = false
   let expiringCount = 0
   let expiryCheckTimer = null
 
@@ -72,7 +71,7 @@
   }
 
   async function setTtl(secs) {
-    showTtlMenu = false
+    showMoreMenu = false
     await invoke('set_ttl', { peerId, ttlSeconds: secs }).catch(() => {})
     ttl = secs
   }
@@ -177,6 +176,7 @@
 
   // ── Polls ──────────────────────────────────────────────────────────────────
 
+  let showAttachMenu = false
   let showPollModal = false
   let pollQuestion = ''
   let pollOptions = ['', '']
@@ -588,7 +588,6 @@
 
   // ── C15 Data Retention ────────────────────────────────────────────────────────
   let retentionCount = 0
-  let showRetentionMenu = false
   const RETENTION_OPTIONS = [
     { label: 'Unlimited', value: 0 },
     { label: 'Last 500', value: 500 },
@@ -599,7 +598,7 @@
 
   async function setRetention(count) {
     retentionCount = count
-    showRetentionMenu = false
+    showMoreMenu = false
     try {
       await invoke('set_retention', { peerId: convKey, retentionCount: count })
       if (count > 0) {
@@ -701,10 +700,7 @@
     fileInput?.click()
   }
 
-  async function onFileSelected(e) {
-    const file = e.target.files?.[0]
-    if (!file) return
-    e.target.value = ''
+  async function sendFile(file) {
     sending = true
     error = ''
     try {
@@ -758,6 +754,13 @@
     } finally {
       sending = false
     }
+  }
+
+  async function onFileSelected(e) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    e.target.value = ''
+    await sendFile(file)
   }
 
   async function leaveGroup() {
@@ -887,11 +890,12 @@
       saveDraft(peerId, '')
       await tick()
       scrollBottom()
-      textareaEl?.focus()
     } catch (e) {
       error = String(e)
     } finally {
       sending = false
+      await tick()
+      textareaEl?.focus()
     }
   }
 
@@ -1013,6 +1017,44 @@
   let slashQuery = ''
   let slashPaletteRef
 
+  // ── Chat background ──────────────────────────────────────────────────────────
+  $: bgImageData = $chatBg.type === 'image' ? (localStorage.getItem('chat_bg_image') ?? '') : ''
+  $: chatBgStyle = (() => {
+    const { type, gradient, blur } = $chatBg
+    const blurStyle = blur > 0 ? `filter:blur(${blur}px);transform:scale(1.08);` : ''
+    if (type === 'gradient') return `background:${CHAT_GRADIENTS[gradient]?.css ?? ''};${blurStyle}`
+    if (type === 'image' && bgImageData) return `background:url('${bgImageData}') center/cover no-repeat;${blurStyle}`
+    return ''
+  })()
+
+  // ── Long-press send (C4) ─────────────────────────────────────────────────────
+  let sendMenuOpen = false
+  let sendLongTimer = null
+
+  function onSendPointerDown(e) {
+    if (e.button !== 0) return
+    sendLongTimer = setTimeout(() => { sendLongTimer = null; sendMenuOpen = true }, 500)
+  }
+  function onSendPointerUp() {
+    if (sendLongTimer !== null) { clearTimeout(sendLongTimer); sendLongTimer = null; send() }
+  }
+  function onSendPointerCancel() {
+    if (sendLongTimer !== null) { clearTimeout(sendLongTimer); sendLongTimer = null }
+  }
+
+  // ── /help modal ──────────────────────────────────────────────────────────────
+  let showHelpModal = false
+  const HELP_COMMANDS = [
+    { icon: '🗑',  cmd: 'clear',    desc: 'Delete all local messages' },
+    { icon: '🔕',  cmd: 'mute',     desc: 'Mute: 1h | 8h | 1w | off' },
+    { icon: '⏱',  cmd: 'ttl',      desc: 'Disappearing messages: off | 1h | 1d | 1w' },
+    { icon: '⬇',  cmd: 'export',   desc: 'Export chat: json | html | md' },
+    { icon: '🔍',  cmd: 'search',   desc: 'Search in conversation' },
+    { icon: '📊',  cmd: 'poll',     desc: 'Create a poll (groups only)' },
+    { icon: '🕐',  cmd: 'schedule', desc: 'Send a message at a specific time' },
+    { icon: '❓',  cmd: 'help',     desc: 'Show this command reference' },
+  ]
+
   async function executeSlashCommand(cmd) {
     showSlashPalette = false
     text = ''
@@ -1024,10 +1066,10 @@
         }
         break
       case 'mute':
-        showMuteMenu = true
+        showMoreMenu = true
         break
       case 'ttl':
-        showTtlMenu = true
+        showMoreMenu = true
         break
       case 'export':
         showExport = true
@@ -1040,6 +1082,9 @@
         break
       case 'schedule':
         showScheduleModal = true
+        break
+      case 'help':
+        showHelpModal = true
         break
     }
     await tick()
@@ -1417,8 +1462,8 @@
 </script>
 
 <svelte:window
-  on:click={() => { showMuteMenu = false; showTtlMenu = false; showRetentionMenu = false; showStickerPicker = false }}
-  on:keydown={e => e.key === 'Escape' && (showMuteMenu = false, showTtlMenu = false, showRetentionMenu = false, showSlashPalette = false, showMentionPicker = false, cancelEdit(), showEditHistory = null, pickerVisible = {}, showStickerPicker = false, showEventModal = false, showScheduleModal = false)}
+  on:click={() => { showMoreMenu = false; showStickerPicker = false; showAttachMenu = false; sendMenuOpen = false }}
+  on:keydown={e => e.key === 'Escape' && (showMoreMenu = false, showSlashPalette = false, showMentionPicker = false, cancelEdit(), showEditHistory = null, pickerVisible = {}, showStickerPicker = false, showAttachMenu = false, showEventModal = false, showScheduleModal = false, sendMenuOpen = false, showHelpModal = false)}
 />
 
 <div class="pane">
@@ -1469,86 +1514,65 @@
       >🔒</button>
     {/if}
 
-    <!-- Detail panel toggle -->
-    {#if onToggleDetail}
-      <button
-        class="icon-hdr-btn"
-        class:active={detailOpen}
-        title={detailOpen ? 'Hide info panel' : 'Show info panel'}
-        on:click={onToggleDetail}
-      >ℹ</button>
-    {/if}
-
-    <!-- Mute, TTL, Export controls (hidden for Saved Messages) -->
-    <div class="header-extras" class:hidden={isSaved}>
-      <!-- Mute button -->
-      <div class="popover-wrap">
+    <div class="header-extras">
+      {#if onToggleDetail}
         <button
           class="icon-hdr-btn"
-          class:active-mute={muteSettings.is_muted}
-          title={muteSettings.is_muted ? 'Unmute' : 'Mute'}
-          aria-label={muteSettings.is_muted ? 'Unmute conversation' : 'Mute conversation'}
-          on:click|stopPropagation={() => showMuteMenu = !showMuteMenu}
-        >{muteSettings.is_muted ? '🔕' : '🔔'}</button>
-        {#if showMuteMenu}
-          <div class="popover" role="menu" on:click|stopPropagation>
-            {#if muteSettings.is_muted}
-              <button class="pop-item" on:click={() => setMute(0)}>🔔 Unmute</button>
-            {:else}
-              <button class="pop-item" on:click={() => setMute(1)}>Mute 1 hour</button>
-              <button class="pop-item" on:click={() => setMute(8)}>Mute 8 hours</button>
-              <button class="pop-item" on:click={() => setMute(168)}>Mute 1 week</button>
-              <button class="pop-item" on:click={() => setMute(null)}>Mute forever</button>
-            {/if}
-          </div>
-        {/if}
-      </div>
-
-      <!-- TTL button -->
-      <div class="popover-wrap">
-        <button
-          class="icon-hdr-btn"
-          class:active-ttl={ttl > 0}
-          title="Disappearing messages"
-          aria-label="Set message expiry"
-          on:click|stopPropagation={() => showTtlMenu = !showTtlMenu}
-        >⏱</button>
-        {#if showTtlMenu}
-          <div class="popover" role="menu" on:click|stopPropagation>
-            <button class="pop-item" class:selected={ttl===0}      on:click={() => setTtl(0)}>Off</button>
-            <button class="pop-item" class:selected={ttl===86400}   on:click={() => setTtl(86400)}>24 hours</button>
-            <button class="pop-item" class:selected={ttl===604800}  on:click={() => setTtl(604800)}>7 days</button>
-            <button class="pop-item" class:selected={ttl===2592000} on:click={() => setTtl(2592000)}>30 days</button>
-          </div>
-        {/if}
-      </div>
-
-      <!-- Export button -->
-      <button
-        class="icon-hdr-btn"
-        title="Export chat"
-        aria-label="Export chat"
-        on:click|stopPropagation={() => showExport = !showExport}
-      >⬇</button>
-
-      <!-- Retention button -->
-      <div class="popover-wrap">
-        <button
-          class="icon-hdr-btn"
-          title="Message retention"
-          aria-label="Set message retention limit"
-          class:active-ttl={retentionCount > 0}
-          on:click|stopPropagation={() => showRetentionMenu = !showRetentionMenu}
-        >♻</button>
-        {#if showRetentionMenu}
-          <div class="popover" role="menu" on:click|stopPropagation>
-            {#each RETENTION_OPTIONS as opt}
-              <button class="pop-item" class:selected={retentionCount === opt.value}
-                on:click={() => setRetention(opt.value)}>{opt.label}</button>
-            {/each}
-          </div>
-        {/if}
-      </div>
+          class:active={detailOpen}
+          title={detailOpen ? 'Hide info panel' : 'Show info panel'}
+          aria-label={detailOpen ? 'Hide info panel' : 'Show info panel'}
+          on:click={onToggleDetail}
+        >ℹ</button>
+      {/if}
+      {#if !isSaved}
+        <div class="popover-wrap">
+          <button
+            class="icon-hdr-btn"
+            class:active-mute={muteSettings.is_muted}
+            class:active-ttl={ttl > 0 || retentionCount > 0}
+            title="Conversation settings"
+            aria-label="Conversation settings"
+            on:click|stopPropagation={() => showMoreMenu = !showMoreMenu}
+          >⋯</button>
+          {#if showMoreMenu}
+            <div class="conv-settings-menu" role="menu" tabindex="0" on:click|stopPropagation on:keydown|stopPropagation>
+              <!-- Mute row -->
+              <div class="csm-row">
+                <span class="csm-label">🔔</span>
+                <div class="csm-pills">
+                  <button class="csm-pill" class:selected={!muteSettings.is_muted} on:mousedown|preventDefault on:click={() => setMute(0)}>On</button>
+                  <button class="csm-pill" class:selected={muteSettings.is_muted} on:mousedown|preventDefault on:click={() => setMute(1)}>1h</button>
+                  <button class="csm-pill" on:mousedown|preventDefault on:click={() => setMute(8)}>8h</button>
+                  <button class="csm-pill" on:mousedown|preventDefault on:click={() => setMute(168)}>1w</button>
+                  <button class="csm-pill" on:mousedown|preventDefault on:click={() => setMute(null)}>∞</button>
+                </div>
+              </div>
+              <!-- TTL row -->
+              <div class="csm-row">
+                <span class="csm-label">⏱</span>
+                <div class="csm-pills">
+                  <button class="csm-pill" class:selected={ttl===0} on:mousedown|preventDefault on:click={() => setTtl(0)}>Off</button>
+                  <button class="csm-pill" class:selected={ttl===86400} on:mousedown|preventDefault on:click={() => setTtl(86400)}>24h</button>
+                  <button class="csm-pill" class:selected={ttl===604800} on:mousedown|preventDefault on:click={() => setTtl(604800)}>7d</button>
+                  <button class="csm-pill" class:selected={ttl===2592000} on:mousedown|preventDefault on:click={() => setTtl(2592000)}>30d</button>
+                </div>
+              </div>
+              <!-- Retention row -->
+              <div class="csm-row">
+                <span class="csm-label">♻</span>
+                <div class="csm-pills">
+                  <button class="csm-pill" class:selected={retentionCount===0} on:mousedown|preventDefault on:click={() => setRetention(0)}>All</button>
+                  <button class="csm-pill" class:selected={retentionCount===500} on:mousedown|preventDefault on:click={() => setRetention(500)}>500</button>
+                  <button class="csm-pill" class:selected={retentionCount===1000} on:mousedown|preventDefault on:click={() => setRetention(1000)}>1K</button>
+                  <button class="csm-pill" class:selected={retentionCount===5000} on:mousedown|preventDefault on:click={() => setRetention(5000)}>5K</button>
+                </div>
+              </div>
+              <div class="csm-divider"></div>
+              <button class="csm-action" on:click={() => { showExport = true; showMoreMenu = false }}>⬇ Export chat…</button>
+            </div>
+          {/if}
+        </div>
+      {/if}
     </div>
   </div>
 
@@ -1618,10 +1642,19 @@
   <div
     class="messages-wrap"
     class:drag-over={dragging}
+    role="region"
+    aria-label="Messages"
     on:dragover={onDragOver}
     on:dragleave={onDragLeave}
     on:drop={onDrop}
   >
+  {#if $chatBg.type !== 'none' && chatBgStyle}
+    <div class="chat-bg-layer" style={chatBgStyle} aria-hidden="true">
+      {#if $chatBg.dim > 0}
+        <div class="chat-bg-dim" style="opacity:{$chatBg.dim / 100}"></div>
+      {/if}
+    </div>
+  {/if}
   {#if dragging}
     <div class="drag-overlay">Drop files to send</div>
   {/if}
@@ -1668,6 +1701,7 @@
           <div
             class="bubble md-content"
             class:mine
+            role="group"
             on:mouseenter={() => showPicker(msgKey)}
             on:mouseleave={() => hidePicker(msgKey)}
           >
@@ -1689,6 +1723,7 @@
                 {@const thumbUrl = getThumbnailUrl(msgKey, m.thumb_data)}
                 {#if thumbUrl}
                   <div class="thumb-wrap">
+                    <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
                     <img
                       class="thumb-img"
                       src={thumbUrl}
@@ -1823,6 +1858,9 @@
                 class="reaction-picker"
                 class:mine
                 class:picker-below={i < 3}
+                role="toolbar"
+                aria-label="Quick reactions"
+                tabindex="0"
                 on:mouseenter={() => keepPicker(msgKey)}
                 on:mouseleave={() => hidePicker(msgKey)}
               >
@@ -1935,6 +1973,7 @@
           type="button"
           class="mention-item"
           role="option"
+          aria-selected={false}
           on:mousedown|preventDefault={() => selectMention(member)}
         >@{member.username}</button>
       {/each}
@@ -1942,6 +1981,7 @@
   {/if}
 
   {#if showStickerPicker}
+    <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
     <div class="sticker-picker-wrap" on:click|stopPropagation>
       <StickerPicker
         onSelect={(s) => sendSticker(s)}
@@ -1961,45 +2001,40 @@
     <button
       type="button"
       class="attach-btn"
-      title="Create poll"
-      aria-label="Create poll"
-      disabled={sending}
-      on:click={() => showPollModal = true}
-    >📊</button>
-    <button
-      type="button"
-      class="attach-btn"
       title="Stickers"
       aria-label="Stickers"
       disabled={sending}
-      on:click|stopPropagation={() => showStickerPicker = !showStickerPicker}
+      on:mousedown|preventDefault
+      on:click|stopPropagation={() => { showStickerPicker = !showStickerPicker; showAttachMenu = false }}
     >😊</button>
-    {#if isGroup || isChannel}
-    <button
-      type="button"
-      class="attach-btn"
-      title="Share location"
-      aria-label="Share location"
-      disabled={sending}
-      on:click={sendLocation}
-    >📍</button>
-    <button
-      type="button"
-      class="attach-btn"
-      title="Create event"
-      aria-label="Create event"
-      disabled={sending}
-      on:click={() => showEventModal = true}
-    >📅</button>
-    {/if}
-    <button
-      type="button"
-      class="attach-btn"
-      title="Attach file"
-      aria-label="Attach file"
-      disabled={sending}
-      on:click={attachFile}
-    >📎</button>
+    <div class="attach-menu-wrap" role="none">
+      <button
+        type="button"
+        class="attach-btn"
+        title="Attach"
+        aria-label="Attach"
+        disabled={sending}
+        on:mousedown|preventDefault
+        on:click|stopPropagation={() => { showAttachMenu = !showAttachMenu; showStickerPicker = false }}
+      >📎</button>
+      {#if showAttachMenu}
+      <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
+      <div class="attach-popup" role="menu" tabindex="0" on:click|stopPropagation>
+        <button class="attach-item" role="menuitem" on:mousedown|preventDefault on:click={() => { attachFile(); showAttachMenu = false }}>
+          <span class="attach-item-ico">📄</span><span>File</span>
+        </button>
+        <button class="attach-item" role="menuitem" on:mousedown|preventDefault on:click={() => { showPollModal = true; showAttachMenu = false }}>
+          <span class="attach-item-ico">📊</span><span>Poll</span>
+        </button>
+        <button class="attach-item" role="menuitem" on:mousedown|preventDefault on:click={() => { sendLocation(); showAttachMenu = false }}>
+          <span class="attach-item-ico">📍</span><span>Location</span>
+        </button>
+        <button class="attach-item" role="menuitem" on:mousedown|preventDefault on:click={() => { showEventModal = true; showAttachMenu = false }}>
+          <span class="attach-item-ico">📅</span><span>Event</span>
+        </button>
+      </div>
+      {/if}
+    </div>
     <textarea
       bind:value={text}
       bind:this={textareaEl}
@@ -2054,12 +2089,36 @@
       </button>
     {/if}
     {#if recState === 'idle' && text.trim() && !isSaved}
-      <button type="button" class="sched-btn" title="Schedule for later" aria-label="Schedule message for later" on:click={() => showScheduleModal = true}>🕐</button>
+      <button type="button" class="sched-btn" title="Schedule for later" aria-label="Schedule message for later" on:mousedown|preventDefault on:click={() => showScheduleModal = true}>🕐</button>
     {/if}
     {#if recState === 'idle'}
-      <button class="send-btn" type="submit" disabled={sending || !text.trim()} title="Send (Enter)" aria-label="Send message">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
-      </button>
+      <div class="send-wrap">
+        <button
+          class="send-btn"
+          type="button"
+          disabled={sending || !text.trim()}
+          title="Send (Enter) · Hold to schedule"
+          aria-label="Send message (hold to schedule)"
+          on:pointerdown={onSendPointerDown}
+          on:pointerup={onSendPointerUp}
+          on:pointerleave={onSendPointerCancel}
+          on:pointercancel={onSendPointerCancel}
+          on:contextmenu|preventDefault
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+        </button>
+        {#if sendMenuOpen}
+          <div class="send-ctx-menu" role="menu" on:click|stopPropagation>
+            <button role="menuitem" on:click={() => { sendMenuOpen = false; send() }}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+              Send now
+            </button>
+            <button role="menuitem" on:click={() => { sendMenuOpen = false; showScheduleModal = true }}>
+              🕐 Schedule…
+            </button>
+          </div>
+        {/if}
+      </div>
     {/if}
   </form>
 
@@ -2068,8 +2127,33 @@
   {/if}
 </div>
 
+{#if showHelpModal}
+  <div class="help-overlay" role="dialog" aria-modal="true" on:click|self={() => showHelpModal = false}>
+    <div class="help-box">
+      <div class="help-hdr">
+        <span>Slash commands</span>
+        <button class="help-close" on:click={() => showHelpModal = false} aria-label="Close">✕</button>
+      </div>
+      <div class="help-list">
+        {#each HELP_COMMANDS as c}
+          <div class="help-item">
+            <span class="help-icon">{c.icon}</span>
+            <span class="help-cmd">/{c.cmd}</span>
+            <span class="help-desc">{c.desc}</span>
+          </div>
+        {/each}
+      </div>
+      <div class="help-hint">Type <kbd>/</kbd> in the message box to use a command</div>
+    </div>
+  </div>
+{/if}
+
 {#if lightboxUrl}
-  <div class="lightbox-overlay" role="dialog" aria-modal="true" on:click={() => { URL.revokeObjectURL(lightboxUrl); lightboxUrl = null }}>
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
+  <div class="lightbox-overlay" role="dialog" aria-modal="true"
+    on:click={() => { URL.revokeObjectURL(lightboxUrl); lightboxUrl = null }}
+    on:keydown={e => { if (e.key === 'Escape') { URL.revokeObjectURL(lightboxUrl); lightboxUrl = null } }}>
+    <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
     <img class="lightbox-img" src={lightboxUrl} alt="full size" on:click|stopPropagation />
     <button class="lightbox-close" on:click={() => { URL.revokeObjectURL(lightboxUrl); lightboxUrl = null }}>✕</button>
   </div>
@@ -2077,8 +2161,9 @@
 
 <!-- Poll creation modal -->
 {#if showPollModal}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
   <div class="modal-overlay" role="dialog" aria-modal="true" on:click|self={() => showPollModal = false}>
-    <div class="modal-box poll-modal" on:keydown={trapFocus}>
+    <div class="modal-box poll-modal" role="document" on:keydown={trapFocus}>
       <div class="modal-title">Create Poll</div>
       <input
         class="modal-input"
@@ -2120,8 +2205,9 @@
 
 <!-- Export chat dialog -->
 {#if showExport}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
   <div class="modal-overlay" role="dialog" aria-modal="true" on:click|self={() => showExport = false}>
-    <div class="modal-box" on:keydown={trapFocus}>
+    <div class="modal-box" role="document" on:keydown={trapFocus}>
       <div class="modal-title">Export chat</div>
       <label class="modal-label">Format
         <select bind:value={exportFormat}>
@@ -2148,8 +2234,9 @@
 
 <!-- Edit history modal -->
 {#if showEditHistory}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
   <div class="modal-overlay" role="dialog" aria-modal="true" on:click|self={() => showEditHistory = null}>
-    <div class="modal-box" on:keydown={trapFocus}>
+    <div class="modal-box" role="document" on:keydown={trapFocus}>
       <div class="modal-title">Edit history</div>
       {#if showEditHistory.history.length === 0}
         <p class="modal-empty">No history yet.</p>
@@ -2182,8 +2269,9 @@
 
 <!-- C6 Schedule modal -->
 {#if showScheduleModal && !isSaved}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
   <div class="modal-overlay" on:click|self={() => showScheduleModal = false} role="dialog" aria-modal="true">
-    <div class="modal-box" on:keydown={trapFocus}>
+    <div class="modal-box" role="document" on:keydown={trapFocus}>
       <div class="modal-title">🕐 Schedule Message</div>
       <div class="sched-preview">{text.trim() || '(type a message first)'}</div>
       <input
@@ -2202,7 +2290,8 @@
 
 <!-- Video recording modal -->
 {#if showVideoModal}
-  <div class="modal-overlay video-modal-overlay" on:click|self={() => closeVideoModal(true)}>
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
+  <div class="modal-overlay video-modal-overlay" role="dialog" aria-modal="true" on:click|self={() => closeVideoModal(true)}>
     <div class="video-modal-box">
       <div class="video-modal-title">Video message</div>
       <!-- svelte-ignore a11y-media-has-caption -->
@@ -2326,13 +2415,31 @@
     overflow: hidden;
   }
 
+  /* ── Chat background layer ───────────────────────────────────────────────── */
+  .chat-bg-layer {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    overflow: hidden;
+    pointer-events: none;
+  }
+  .chat-bg-dim {
+    position: absolute;
+    inset: 0;
+    background: #000;
+    pointer-events: none;
+  }
+
   .messages {
     flex: 1;
     overflow-y: auto;
     padding: 16px;
     display: flex;
     flex-direction: column;
+    justify-content: flex-end;
     gap: 6px;
+    position: relative;
+    z-index: 1;
   }
 
   .scroll-btn {
@@ -2684,6 +2791,45 @@
   }
   .attach-btn:hover:not(:disabled) { background: var(--bg-hover); color: var(--text); }
 
+  .attach-menu-wrap { position: relative; }
+  .attach-popup {
+    position: absolute;
+    bottom: calc(100% + 8px);
+    left: 0;
+    z-index: 60;
+    background: var(--bg-2, #1e1e2e);
+    border: 1px solid var(--border, #313244);
+    border-radius: 10px;
+    box-shadow: 0 8px 28px rgba(0,0,0,0.45);
+    padding: 6px;
+    min-width: 160px;
+  }
+  .attach-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    background: none;
+    color: var(--text);
+    text-align: left;
+    padding: 8px 12px;
+    font-size: 13px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .attach-item:hover { background: var(--bg-hover); }
+  .attach-item-ico {
+    font-size: 18px;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg-active, rgba(137,180,250,0.12));
+    border-radius: 8px;
+    flex-shrink: 0;
+  }
+
   .compose {
     display: flex;
     gap: 8px;
@@ -2772,14 +2918,55 @@
 
   /* ── Header extras ───────────────────────────────────────────────────────── */
   .header-extras { display: flex; align-items: center; gap: 4px; margin-left: auto; flex-shrink: 0; }
-  .header-extras.hidden { display: none; }
   .icon-hdr-btn {
     background: none; border: none; cursor: pointer;
     color: var(--text-muted); font-size: 14px; padding: 3px 5px; border-radius: 4px;
   }
   .icon-hdr-btn:hover { background: var(--bg-hover); color: var(--text); }
+  .icon-hdr-btn.active { background: var(--bg-active); color: var(--accent); }
   .icon-hdr-btn.active-mute { color: var(--danger, #f38ba8); }
   .icon-hdr-btn.active-ttl  { color: var(--accent); }
+
+  /* ── Conversation settings menu (⋯) ─────────────────────────────────────── */
+  .conv-settings-menu {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 50;
+    background: var(--bg-2, #1e1e2e);
+    border: 1px solid var(--border, #313244);
+    border-radius: 10px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    padding: 8px;
+    min-width: 260px;
+  }
+  .csm-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 0;
+  }
+  .csm-label { font-size: 14px; flex-shrink: 0; width: 22px; text-align: center; }
+  .csm-pills { display: flex; gap: 4px; flex-wrap: wrap; }
+  .csm-pill {
+    background: none;
+    color: var(--text-muted);
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s;
+  }
+  .csm-pill:hover { background: var(--bg-hover); color: var(--text); }
+  .csm-pill.selected { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .csm-divider { height: 1px; background: var(--border); margin: 6px 0; }
+  .csm-action {
+    display: block; width: 100%; background: none; color: var(--text-muted);
+    text-align: left; font-size: 12px; padding: 5px 8px; border-radius: 6px; cursor: pointer;
+    border: none;
+  }
+  .csm-action:hover { background: var(--bg-hover); color: var(--text); }
 
   /* ── Popovers ─────────────────────────────────────────────────────────────── */
   .popover-wrap { position: relative; }
@@ -3016,11 +3203,77 @@
   .pin-item-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
 
   /* ── Send button ─────────────────────────────────────────────────────────── */
+  /* ── Send long-press menu ────────────────────────────────────────────────── */
+  .send-wrap { position: relative; display: flex; align-items: center; }
+  .send-ctx-menu {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    right: 0;
+    z-index: 60;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.35);
+    overflow: hidden;
+    min-width: 140px;
+  }
+  .send-ctx-menu button {
+    display: flex; align-items: center; gap: 7px;
+    width: 100%; padding: 9px 13px;
+    background: none; color: var(--text); font-size: 13px;
+    border-radius: 0; text-align: left;
+    transition: background 0.1s;
+  }
+  .send-ctx-menu button:hover { background: var(--bg-hover); }
+
+  /* ── /help modal ─────────────────────────────────────────────────────────── */
+  .help-overlay {
+    position: fixed; inset: 0; z-index: 250;
+    background: rgba(0,0,0,0.45); backdrop-filter: blur(2px);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .help-box {
+    background: var(--bg-panel); border: 1px solid var(--border);
+    border-radius: 12px; box-shadow: 0 12px 40px rgba(0,0,0,0.4);
+    width: 420px; max-width: calc(100vw - 32px);
+    overflow: hidden; animation: sm-in 0.14s ease;
+  }
+  .help-hdr {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 13px 16px; border-bottom: 1px solid var(--border);
+    font-weight: 700; font-size: 14px; color: var(--text);
+  }
+  .help-close {
+    background: none; color: var(--text-muted); font-size: 14px;
+    padding: 3px 6px; border-radius: 5px; line-height: 1;
+  }
+  .help-close:hover { background: var(--bg-hover); color: var(--text); }
+  .help-list { padding: 8px 0; }
+  .help-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 16px;
+    border-bottom: 1px solid var(--border-sub);
+  }
+  .help-item:last-child { border-bottom: none; }
+  .help-icon { font-size: 15px; width: 20px; flex-shrink: 0; text-align: center; }
+  .help-cmd { font-size: 12px; font-weight: 700; color: var(--accent); min-width: 80px; }
+  .help-desc { font-size: 12px; color: var(--text-muted); flex: 1; }
+  .help-hint {
+    padding: 8px 16px; font-size: 11px; color: var(--text-dim);
+    border-top: 1px solid var(--border); background: var(--bg);
+  }
+  .help-hint kbd {
+    background: var(--bg-hover); border: 1px solid var(--border);
+    border-radius: 3px; padding: 0 4px; font-size: 11px;
+    font-family: inherit; color: var(--text-muted);
+  }
+
   .send-btn {
     width: 36px; height: 36px;
     border-radius: 50%;
     background: var(--accent);
     color: #fff;
+    padding: 0;
     display: flex; align-items: center; justify-content: center;
     flex-shrink: 0;
     transition: background 0.15s, transform 0.1s;

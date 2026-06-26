@@ -6,6 +6,7 @@ const host = process.env.TAURI_DEV_HOST
 export default defineConfig({
   plugins: [svelte()],
   clearScreen: false,
+  build: { chunkSizeWarningLimit: 1600 },
   server: {
     port: 5173,
     strictPort: true,

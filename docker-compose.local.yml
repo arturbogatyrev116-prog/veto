@@ -36,6 +36,7 @@ services:
       RUST_LOG: messenger_server=info,tower_http=warn
       ADMIN_TOKEN: ${ADMIN_TOKEN:-changeme}
       ADMIN_UI_DIR: /app/admin-ui
+      LIBRETRANSLATE_URL: http://libretranslate:5000
       # No TLS vars → runs plain HTTP on port 3000
     volumes:
       - ./admin-ui/dist:/app/admin-ui:ro
@@ -48,6 +49,23 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  libretranslate:
+    image: libretranslate/libretranslate:latest
+    restart: unless-stopped
+    environment:
+      LT_DISABLE_WEB_UI: "true"
+      LT_LOAD_ONLY: ${LT_LANGUAGES:-en,ru}
+      LT_THREADS: "2"
+    volumes:
+      - lt_models_local:/home/libretranslate/.local
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5000/languages || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
 volumes:
   postgres_data_local:
   nats_data_local:
+  lt_models_local:

@@ -41,7 +41,8 @@
 
 <svelte:window on:keydown={e => e.key === 'Escape' && dispatch('close')} />
 
-<div class="overlay" on:click|self={() => dispatch('close')}>
+<!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
+<div class="overlay" role="dialog" aria-modal="true" on:click|self={() => dispatch('close')}>
   <div class="modal">
     <div class="modal-header">
       <span class="modal-title">📊 Chat Statistics</span>

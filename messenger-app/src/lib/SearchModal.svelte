@@ -66,6 +66,7 @@
 <svelte:window on:keydown={onKeydown} />
 
 {#if $showSearch}
+<!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
 <div class="overlay" on:click|self={close} role="dialog" aria-modal="true">
   <div class="modal">
     <div class="header">

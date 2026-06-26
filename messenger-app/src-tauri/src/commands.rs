@@ -3118,8 +3118,9 @@ pub async fn save_note(text: String, app: AppHandle) -> Result<i64, String> {
     };
     let (nonce, ct) = store::encrypt_content(&text, &key);
     let db = state.db.lock().unwrap();
-    if let Some(conn) = db.as_ref() {
-        db::save_note(conn, &nonce, &ct, &text, ts);
+    match db.as_ref() {
+        Some(conn) => db::save_note(conn, &nonce, &ct, &text, ts).map_err(|e| e.to_string())?,
+        None => return Err("database not open".into()),
     }
     Ok(ts)
 }
@@ -3750,24 +3751,23 @@ pub async fn translate_message(
 ) -> Result<String, String> {
     let state = app.state::<AppState>();
 
-    let resp: serde_json::Value = state.http
-        .post("https://libretranslate.com/translate")
-        .json(&serde_json::json!({
-            "q": text,
-            "source": "auto",
-            "target": target_lang,
-            "format": "text"
-        }))
-        .send().await.map_err(|e| format!("translation request failed: {e}"))?
-        .json().await.map_err(|e| format!("translation parse failed: {e}"))?;
+    let token = {
+        let id = state.identity.lock().unwrap();
+        id.as_ref().ok_or("not logged in")?.token.clone()
+    };
 
-    resp["translatedText"]
-        .as_str()
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            let err = resp["error"].as_str().unwrap_or("unknown error");
-            format!("translation error: {err}")
-        })
+    #[derive(serde::Deserialize)]
+    struct TranslateResp { translated_text: String, #[allow(dead_code)] cached: bool }
+
+    let resp = state.http
+        .post(format!("{}/api/v1/translate", state.server_url))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({ "text": text, "target_lang": target_lang }))
+        .send().await.map_err(|e| format!("translation request failed: {e}"))?
+        .error_for_status().map_err(|e| format!("translation error: {e}"))?
+        .json::<TranslateResp>().await.map_err(|e| format!("translation parse failed: {e}"))?;
+
+    Ok(resp.translated_text)
 }
 
 // ── D8 RSVP ──────────────────────────────────────────────────────────────────
@@ -3997,6 +3997,37 @@ pub async fn fetch_link_preview(url: String, app: AppHandle) -> Result<Option<db
         if let Some(cached) = guard.as_ref().and_then(|c| db::get_cached_preview(c, &url)) {
             return Ok(Some(cached));
         }
+    }
+
+    // YouTube oEmbed fast-path — scraping YT pages returns cookie-consent HTML with no og:tags
+    let is_youtube = matches!(host.as_str(), "www.youtube.com" | "youtube.com" | "m.youtube.com" | "youtu.be");
+    if is_youtube {
+        let state = app.state::<AppState>();
+        let resp = state.http
+            .get("https://www.youtube.com/oembed")
+            .query(&[("url", url.as_str()), ("format", "json")])
+            .header("User-Agent", "Mozilla/5.0 (compatible; veto-bot/1.0)")
+            .timeout(Duration::from_secs(8))
+            .send()
+            .await;
+        if let Ok(r) = resp {
+            if let Ok(json) = r.json::<serde_json::Value>().await {
+                let title     = json["title"].as_str().map(str::to_owned);
+                let description = json["author_name"].as_str().map(|a| format!("by {a}"));
+                let image_url   = json["thumbnail_url"].as_str()
+                    .filter(|u| u.starts_with("https://"))
+                    .map(str::to_owned);
+                if title.is_some() {
+                    let preview = db::LinkPreview {
+                        url: url.clone(), title, description, image_url, domain,
+                    };
+                    let guard = state.db.lock().unwrap();
+                    if let Some(conn) = guard.as_ref() { db::upsert_preview(conn, &preview); }
+                    return Ok(Some(preview));
+                }
+            }
+        }
+        return Ok(None); // oEmbed failed — don't fall through to generic HTML scraping
     }
 
     // Fetch HTML

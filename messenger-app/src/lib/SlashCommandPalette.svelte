@@ -11,6 +11,7 @@
     { cmd: 'search',   icon: '🔍',  label: 'Search',                desc: 'Search in conversation',           group: false },
     { cmd: 'poll',     icon: '📊',  label: 'Create poll',           desc: 'Open poll wizard',                 group: true  },
     { cmd: 'schedule', icon: '🕐',  label: 'Schedule message',      desc: 'Send at a specific time',          group: false },
+    { cmd: 'help',     icon: '❓',  label: 'Help',                  desc: 'Show all slash commands',          group: false },
   ]
 
   $: filtered = (() => {

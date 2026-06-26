@@ -7,6 +7,7 @@ pub mod polls;
 pub mod prekeys;
 pub mod register;
 pub mod sessions;
+pub mod translate;
 pub mod updates;
 pub mod users;
 pub mod ws;
@@ -59,6 +60,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/api/v1/polls/{poll_id}", get(polls::get_one))
         .route("/api/v1/polls/{poll_id}/vote", post(polls::vote))
         .route("/api/v1/polls/{poll_id}/close", post(polls::close))
+        .route("/api/v1/translate", post(translate::handler))
         .route("/ws", get(ws::handler))
         .layer(middleware::from_fn_with_state(state, auth::rate_limit))
 }

@@ -31,7 +31,7 @@
 
 <svelte:window on:keydown={onKey} />
 
-<!-- svelte-ignore a11y-click-events-have-key-events -->
+<!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
 <div class="overlay" role="dialog" aria-modal="true" on:click|self={close}>
   <div class="modal">
     <div class="modal-header">

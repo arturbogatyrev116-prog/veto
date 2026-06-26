@@ -92,3 +92,26 @@ export function stopAudio() {
   if (prev) { prev.el.pause() }
   nowPlaying.set(null)
 }
+
+// ── Chat background ───────────────────────────────────────────────────────────
+
+export const CHAT_GRADIENTS = {
+  midnight: { label: 'Midnight', css: 'linear-gradient(135deg, #0f0c29, #302b63, #24243e)' },
+  ocean:    { label: 'Ocean',    css: 'linear-gradient(135deg, #1a6b8a, #0d2137)' },
+  forest:   { label: 'Forest',   css: 'linear-gradient(135deg, #1a472a, #2d6a4f)' },
+  sunset:   { label: 'Sunset',   css: 'linear-gradient(135deg, #f5af19, #f12711)' },
+  aurora:   { label: 'Aurora',   css: 'linear-gradient(135deg, #0f3443, #34e89e)' },
+  cherry:   { label: 'Cherry',   css: 'linear-gradient(135deg, #eb3349, #f45c43)' },
+  dusk:     { label: 'Dusk',     css: 'linear-gradient(135deg, #2c3e50, #3498db)' },
+}
+
+function loadChatBg() {
+  try { return JSON.parse(localStorage.getItem('chat_bg') ?? 'null') } catch {}
+  return null
+}
+export const chatBg = writable(
+  loadChatBg() ?? { type: 'none', gradient: 'midnight', blur: 0, dim: 0 }
+)
+chatBg.subscribe(v => {
+  try { localStorage.setItem('chat_bg', JSON.stringify(v)) } catch {}
+})

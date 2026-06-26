@@ -203,12 +203,9 @@ pub fn open(data_dir: &Path) -> Result<Connection, String> {
         );",
     )?;
 
-    // C15 Performance indexes for retention queries
+    // C15 Performance index for retention queries (group messages share the messages table)
     exec(&conn,
         "CREATE INDEX IF NOT EXISTS idx_messages_peer_ts ON messages(peer_id, ts DESC);",
-    )?;
-    exec(&conn,
-        "CREATE INDEX IF NOT EXISTS idx_group_messages_group_ts ON group_messages(group_id, ts DESC);",
     )?;
 
     // C15 Retention column migration (idempotent)
@@ -1199,12 +1196,13 @@ pub fn delete_channel(conn: &Connection, channel_id: &str) {
 
 pub const SAVED_PEER_ID: &str = "__saved__";
 
-pub fn save_note(conn: &Connection, nonce: &[u8; 12], ct: &[u8], plain: &str, ts: i64) {
-    let _ = conn.execute(
+pub fn save_note(conn: &Connection, nonce: &[u8; 12], ct: &[u8], plain: &str, ts: i64) -> rusqlite::Result<()> {
+    conn.execute(
         "INSERT INTO messages (peer_id, direction, ts, nonce, ct, plain) \
          VALUES (?1, 'sent', ?2, ?3, ?4, ?5)",
         params![SAVED_PEER_ID, ts, nonce as &[u8], ct, plain],
-    );
+    )?;
+    Ok(())
 }
 
 // ── Scheduled messages ────────────────────────────────────────────────────────
@@ -1403,11 +1401,6 @@ pub fn enforce_retention_count(conn: &Connection, peer_id: &str, count: i64) {
     let _ = conn.execute(
         "DELETE FROM messages WHERE peer_id=?1 AND id NOT IN \
          (SELECT id FROM messages WHERE peer_id=?1 ORDER BY ts DESC LIMIT ?2)",
-        params![peer_id, count],
-    );
-    let _ = conn.execute(
-        "DELETE FROM group_messages WHERE group_id=?1 AND id NOT IN \
-         (SELECT id FROM group_messages WHERE group_id=?1 ORDER BY ts DESC LIMIT ?2)",
         params![peer_id, count],
     );
 }

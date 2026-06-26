@@ -201,6 +201,7 @@
     color: #fff;
     border: none;
     cursor: pointer;
+    padding: 0;
     display: flex; align-items: center; justify-content: center;
     flex-shrink: 0;
     transition: opacity 0.15s, transform 0.1s;

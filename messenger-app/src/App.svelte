@@ -69,7 +69,7 @@
 
   function notifyIfAllowed(senderName, text) {
     if (isDndActive()) return
-    playNotify()
+    if (localStorage.getItem('sound_enabled') !== 'false') playNotify()
     if (!document.hasFocus()) {
       const body = text ? (text.length > 120 ? text.slice(0, 117) + '…' : text) : '📎 File'
       invoke('show_notification', { title: senderName, body }).catch(() => {})
@@ -297,7 +297,7 @@
     const unlistenMention = await listen('mention', ({ payload }) => {
       if (isDndActive()) return
       const { peer_id, from, text } = payload
-      playMention()
+      if (localStorage.getItem('sound_enabled') !== 'false') playMention()
       if (!document.hasFocus()) {
         const senderName = $peerNames[from] ?? (from ?? '').slice(0, 8)
         const body = text ? (text.length > 120 ? text.slice(0, 117) + '…' : text) : 'You were mentioned'

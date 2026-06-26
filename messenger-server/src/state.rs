@@ -40,6 +40,15 @@ pub struct Inner {
 
     /// Server start timestamp — used by the health endpoint to report uptime.
     pub start_time: Instant,
+
+    /// HTTP client for internal service calls (LibreTranslate, etc.)
+    pub http_client: reqwest::Client,
+
+    /// URL of the LibreTranslate instance. None = translation disabled.
+    pub libretranslate_url: Option<String>,
+
+    /// Per-user translation rate limiter: 30 requests/minute per user_id.
+    pub translate_limiter: DefaultKeyedRateLimiter<String>,
 }
 
 impl AppState {
@@ -53,17 +62,22 @@ impl AppState {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
-        let quota = Quota::per_second(NonZeroU32::new(10).expect("10 > 0"));
+        let libretranslate_url = std::env::var("LIBRETRANSLATE_URL").ok();
+        let global_quota = Quota::per_second(NonZeroU32::new(10).expect("10 > 0"));
+        let translate_quota = Quota::per_minute(NonZeroU32::new(30).expect("30 > 0"));
         Self {
             inner: Arc::new(Inner {
                 db,
                 nats_client,
                 js,
                 sessions: DashMap::new(),
-                rate_limiter: RateLimiter::keyed(quota),
+                rate_limiter: RateLimiter::keyed(global_quota),
                 admin_token_hash,
                 registration_open,
                 start_time: Instant::now(),
+                http_client: reqwest::Client::new(),
+                libretranslate_url,
+                translate_limiter: RateLimiter::keyed(translate_quota),
             }),
         }
     }

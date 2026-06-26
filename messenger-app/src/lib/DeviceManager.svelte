@@ -46,7 +46,8 @@
   }
 </script>
 
-<div class="dm-overlay" on:click|self={() => dispatch('close')}>
+<!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
+<div class="dm-overlay" role="dialog" aria-modal="true" on:click|self={() => dispatch('close')}>
   <div class="dm-panel">
     <div class="dm-header">
       <span class="dm-title">Devices</span>

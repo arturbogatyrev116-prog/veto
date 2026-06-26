@@ -19,6 +19,10 @@ pub enum AppError {
     RateLimited,
     #[error("internal server error")]
     Internal,
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
+    #[error("bad gateway: {0}")]
+    BadGateway(String),
 }
 
 impl From<sqlx::Error> for AppError {
@@ -35,8 +39,10 @@ impl IntoResponse for AppError {
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::Unauthorized  => StatusCode::UNAUTHORIZED,
             AppError::Forbidden     => StatusCode::FORBIDDEN,
-            AppError::RateLimited   => StatusCode::TOO_MANY_REQUESTS,
-            AppError::Internal      => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::RateLimited          => StatusCode::TOO_MANY_REQUESTS,
+            AppError::Internal             => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            AppError::BadGateway(_)        => StatusCode::BAD_GATEWAY,
         };
         (status, Json(json!({ "error": self.to_string() }))).into_response()
     }

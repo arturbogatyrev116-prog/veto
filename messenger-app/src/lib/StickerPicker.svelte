@@ -1,6 +1,6 @@
 <script>
   export let onSelect = null
-  export let onClose = null
+  export const onClose = null
 
   const PACKS = {
     smiles: { label: '😊', stickers: ['😊','😂','🤣','😍','🥰','😘','😎','🤩','😏','😒','😭','😤','😡','🥺','😱','🤔','😴','🤗','😋','🙄'] },

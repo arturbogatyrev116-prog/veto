@@ -139,7 +139,7 @@ struct ParsedMessage {
 
 struct ParsedEdit {
     msg_ts:   i64,
-    msg_from: String,
+    _msg_from: String,
     new_text: String,
     /// peer_id context (gid for groups, else sender_id).
     peer_id:  String,
@@ -256,7 +256,7 @@ fn parse_message_payload(s: &str, fallback_peer_id: &str) -> ParsedMessage {
         return ParsedMessage {
             edit: Some(ParsedEdit {
                 msg_ts:   e.msg_ts,
-                msg_from: e.msg_from,
+                _msg_from: e.msg_from,
                 new_text: e.text,
                 peer_id,
             }),

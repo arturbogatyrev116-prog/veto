@@ -4,7 +4,7 @@
   import { onMount } from 'svelte'
 
   export let pollId
-  export let mine = false
+  export const mine = false
 
   let poll = null
   let loading = true

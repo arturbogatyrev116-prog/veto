@@ -36,6 +36,7 @@ services:
       NATS_URL: nats://nats:4222
       RUST_LOG: messenger_server=info,tower_http=warn
       ADMIN_TOKEN: ${ADMIN_TOKEN:?ADMIN_TOKEN must be set}
+      LIBRETRANSLATE_URL: http://libretranslate:5000
       # TLS — choose one:
       # Option A: provide existing cert/key files
       TLS_CERT_PATH: ${TLS_CERT_PATH:-}
@@ -57,6 +58,23 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # LibreTranslate — self-hosted Argos-based translation engine (on-premise, no Google)
+  libretranslate:
+    image: libretranslate/libretranslate:latest
+    restart: unless-stopped
+    environment:
+      LT_DISABLE_WEB_UI: "true"
+      LT_LOAD_ONLY: ${LT_LANGUAGES:-en,ru,de,fr,es,zh,ar,uk}
+      LT_THREADS: "4"
+    volumes:
+      - lt_models:/home/libretranslate/.local
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5000/languages || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
   # Uptime Kuma — self-hosted monitoring dashboard with Telegram alerts
   # Access via SSH tunnel: ssh -L 3001:localhost:3001 root@server
   # Or open port 3001 in firewall for direct access (restrict by IP if public)
@@ -73,3 +91,4 @@ volumes:
   postgres_data:
   nats_data:
   uptime_kuma_data:
+  lt_models:
