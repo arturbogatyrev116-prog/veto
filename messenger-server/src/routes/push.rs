@@ -25,16 +25,16 @@ pub async fn register(
         return StatusCode::INTERNAL_SERVER_ERROR;
     };
 
-    let res = sqlx::query!(
+    let res = sqlx::query(
         "INSERT INTO push_tokens (user_id, session_id, platform, token)
          VALUES ($1, $2, $3, $4)
          ON CONFLICT (user_id, token) DO UPDATE
              SET session_id = $2, platform = $3, created_at = now()",
-        uid,
-        user.session_id,
-        body.platform,
-        body.token,
     )
+    .bind(uid)
+    .bind(user.session_id)
+    .bind(&body.platform)
+    .bind(&body.token)
     .execute(&state.inner.db)
     .await;
 
@@ -56,11 +56,11 @@ pub async fn unregister(
         return StatusCode::INTERNAL_SERVER_ERROR;
     };
 
-    let _ = sqlx::query!(
+    let _ = sqlx::query(
         "DELETE FROM push_tokens WHERE user_id = $1 AND token = $2",
-        uid,
-        body.token,
     )
+    .bind(uid)
+    .bind(&body.token)
     .execute(&state.inner.db)
     .await;
 

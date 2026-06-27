@@ -1,5 +1,6 @@
 use reqwest::Client;
 use serde::Deserialize;
+use sqlx::Row;
 
 use crate::state::{AppState, CachedToken, FcmServiceAccount};
 
@@ -13,10 +14,10 @@ pub async fn send_push_to_user(state: &AppState, user_id: &str) {
 
     let Ok(uid) = uuid::Uuid::parse_str(user_id) else { return };
 
-    let rows = match sqlx::query!(
+    let rows = match sqlx::query(
         "SELECT platform, token FROM push_tokens WHERE user_id = $1",
-        uid,
     )
+    .bind(uid)
     .fetch_all(&state.inner.db)
     .await
     {
@@ -40,11 +41,13 @@ pub async fn send_push_to_user(state: &AppState, user_id: &str) {
     };
 
     for row in rows {
-        match row.platform.as_str() {
+        let platform: String = row.get("platform");
+        let token: String = row.get("token");
+        match platform.as_str() {
             "fcm" => {
                 send_fcm_v1(
                     &state.inner.http_client,
-                    &row.token,
+                    &token,
                     &access_token,
                     &sa.project_id,
                 )
