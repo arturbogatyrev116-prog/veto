@@ -4509,6 +4509,16 @@ pub async fn register_push_token(
     Ok(())
 }
 
+/// Read the FCM token written by VetoFirebaseService on Android.
+/// Returns None on desktop (no-op) or if the token hasn't been fetched yet.
+#[tauri::command]
+pub fn get_fcm_token(app: AppHandle) -> Option<String> {
+    let cache_dir = app.path().app_cache_dir().ok()?;
+    let token = std::fs::read_to_string(cache_dir.join("fcm_token")).ok()?;
+    let trimmed = token.trim().to_string();
+    if trimmed.is_empty() { None } else { Some(trimmed) }
+}
+
 /// Unregister a push token (call on logout or when the user disables push).
 #[tauri::command]
 pub async fn unregister_push_token(

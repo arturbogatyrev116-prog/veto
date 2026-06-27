@@ -393,6 +393,7 @@ pub fn run() {
             commands::get_retention,
             commands::register_push_token,
             commands::unregister_push_token,
+            commands::get_fcm_token,
             install_update,
         ])
         .run(tauri::generate_context!())

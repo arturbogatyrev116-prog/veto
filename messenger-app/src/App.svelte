@@ -88,6 +88,11 @@
       wsStatus.set('connected')
       connLost.set(false)
       reconnectDelay = 1000  // reset backoff on success
+      // Register FCM token on Android (no-op on desktop — returns null)
+      invoke('get_fcm_token').then(token => {
+        if (token) invoke('register_push_token', { platform: 'fcm', token })
+          .catch(e => console.warn('FCM register failed:', e))
+      }).catch(() => {})
     } catch {
       reconnectDelay = Math.min(reconnectDelay * 2, 30000)
       reconnectTimer = setTimeout(attemptReconnect, reconnectDelay)

@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "528942394833",
+    "project_id": "veto-messenger",
+    "storage_bucket": "veto-messenger.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:528942394833:android:254847e001e01995d244f0",
+        "android_client_info": {
+          "package_name": "com.veto.messenger"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD68DMqhw92xFs7Dy8VqbgI20qJIKbngNg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
