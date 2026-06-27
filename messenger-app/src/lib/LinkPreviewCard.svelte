@@ -2,8 +2,19 @@
   export let preview  // { url, title, description, image_url, domain }
   $: isValidImage = preview.image_url &&
     (preview.image_url.startsWith('http://') || preview.image_url.startsWith('https://'))
+
+  function isValidUrl(url) {
+    try {
+      const parsed = new URL(url)
+      return parsed.protocol === 'http:' || parsed.protocol === 'https:'
+    } catch {
+      return false
+    }
+  }
+  $: validUrl = isValidUrl(preview.url)
 </script>
 
+{#if validUrl}
 <a class="link-preview" href={preview.url} target="_blank" rel="noopener noreferrer">
   {#if isValidImage}
     <img class="lp-thumb" src={preview.image_url} alt="" loading="lazy" />
@@ -14,6 +25,7 @@
     {#if preview.description}<div class="lp-desc">{preview.description}</div>{/if}
   </div>
 </a>
+{/if}
 
 <style>
   .link-preview {

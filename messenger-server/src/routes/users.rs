@@ -66,6 +66,7 @@ pub async fn patch_me(
 pub async fn by_username(
     Path(username): Path<String>,
     State(state): State<AppState>,
+    _auth: AuthUser,
 ) -> Result<impl IntoResponse, AppError> {
     let row = sqlx::query_as::<_, UserRow>(
         "SELECT id, username FROM users WHERE username = $1",

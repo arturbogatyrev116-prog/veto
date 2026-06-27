@@ -1,4 +1,5 @@
 <script>
+  import { onDestroy } from 'svelte'
   import { invoke } from '@tauri-apps/api/core'
 
   export let msg
@@ -33,6 +34,8 @@
       }
     } catch {}
   }
+
+  onDestroy(() => { if (videoUrl) URL.revokeObjectURL(videoUrl) })
 
   $: thumbUrl = getThumbnailUrl(msgKey, msg.thumb_data)
 </script>

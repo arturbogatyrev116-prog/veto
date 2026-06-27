@@ -46,9 +46,12 @@ services:
       # Self-registration: set REGISTRATION_OPEN=1 in .env to allow
       REGISTRATION_OPEN: ${REGISTRATION_OPEN:-}
       ADMIN_UI_DIR: /admin-ui
+      # FCM HTTP v1 push — path to service account JSON on the host
+      FCM_SERVICE_ACCOUNT_PATH: ${FCM_SERVICE_ACCOUNT_PATH:-}
     volumes:
       - ${CERTS_DIR:-./certs}:/certs:ro
       - ./admin-ui/dist:/admin-ui:ro
+      - ${FCM_SA_FILE:-/dev/null}:/etc/veto-fcm.json:ro
     ports:
       - "${BIND_PORT:-443}:3000"
     depends_on:

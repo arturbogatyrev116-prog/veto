@@ -55,9 +55,9 @@
 </script>
 
 <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
-<div class="modal-overlay" role="dialog" aria-modal="true" on:click|self={() => dispatch('close')}>
+<div class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="event-modal-title" on:click|self={() => dispatch('close')}>
   <div class="modal-box">
-    <div class="modal-title">📅 Create Event</div>
+    <div class="modal-title" id="event-modal-title">📅 Create Event</div>
 
     <label class="field-label">Title *
       <!-- svelte-ignore a11y-autofocus -->

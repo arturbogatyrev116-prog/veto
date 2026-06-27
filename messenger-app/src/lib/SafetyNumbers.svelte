@@ -32,10 +32,10 @@
 <svelte:window on:keydown={onKey} />
 
 <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
-<div class="overlay" role="dialog" aria-modal="true" on:click|self={close}>
+<div class="overlay" role="dialog" aria-modal="true" aria-labelledby="safety-numbers-title" on:click|self={close}>
   <div class="modal">
     <div class="modal-header">
-      <span class="title">Safety Number</span>
+      <span class="title" id="safety-numbers-title">Safety Number</span>
       <button class="close-btn" on:click={close} aria-label="Close">✕</button>
     </div>
 

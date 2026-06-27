@@ -37,20 +37,72 @@ pub struct StoredIdentity {
     /// populated on registration and refreshed on each SPK rotation.
     #[serde(default)]
     pub pq_spk_secret: Vec<u8>,
+    /// Refresh token for obtaining new short-lived access tokens.
+    /// Empty string on pre-refresh-token installations (token never expires).
+    #[serde(default)]
+    pub refresh_token: String,
+    /// Unix ms expiry of `token`. 0 = no expiry (pre-refresh-token installations).
+    #[serde(default)]
+    pub token_expires_at: i64,
 }
 
-pub async fn load(path: impl AsRef<Path>) -> Option<StoredIdentity> {
-    let bytes = tokio::fs::read(path).await.ok()?;
-    serde_json::from_slice(&bytes).ok()
+/// Get or create the device-local 32-byte key used to encrypt identity.bin.
+/// The key is stored in the OS keyring and never written to disk in plaintext.
+fn get_or_create_identity_key() -> [u8; 32] {
+    let entry = keyring::Entry::new("veto-messenger", "identity_key")
+        .expect("keyring entry");
+    if let Ok(hex_str) = entry.get_password() {
+        if let Ok(bytes) = hex::decode(hex_str.trim()) {
+            if bytes.len() == 32 {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&bytes);
+                return key;
+            }
+        }
+    }
+    let mut key = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut key);
+    let _ = entry.set_password(&hex::encode(key));
+    key
 }
 
-pub async fn save(path: impl AsRef<Path>, identity: &StoredIdentity) -> std::io::Result<()> {
+/// Save identity encrypted with the OS-keyring-backed device key.
+/// Writes `identity.bin` (nonce[12] || ciphertext) — not human-readable.
+pub async fn save_identity(path: impl AsRef<Path>, identity: &StoredIdentity) -> std::io::Result<()> {
+    use chacha20poly1305::aead::Aead;
     if let Some(parent) = path.as_ref().parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let bytes = serde_json::to_vec_pretty(identity)
+    let key = get_or_create_identity_key();
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let plaintext = serde_json::to_vec(identity)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    tokio::fs::write(path, bytes).await
+    let ciphertext = cipher.encrypt(nonce, plaintext.as_slice())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    let mut out = nonce_bytes.to_vec();
+    out.extend_from_slice(&ciphertext);
+    tokio::fs::write(path, out).await
+}
+
+/// Load and decrypt identity from identity.bin using the OS-keyring-backed device key.
+pub async fn load_identity(path: impl AsRef<Path>) -> Option<StoredIdentity> {
+    use chacha20poly1305::aead::Aead;
+    let data = tokio::fs::read(path).await.ok()?;
+    if data.len() < 13 { return None; }
+    let key = get_or_create_identity_key();
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let nonce = Nonce::from_slice(&data[..12]);
+    let plaintext = cipher.decrypt(nonce, &data[12..]).ok()?;
+    serde_json::from_slice(&plaintext).ok()
+}
+
+/// Legacy plaintext load — used as fallback to migrate existing identity.json files.
+pub async fn load_legacy(path: impl AsRef<Path>) -> Option<StoredIdentity> {
+    let bytes = tokio::fs::read(path).await.ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 // ── Data directory ────────────────────────────────────────────────────────────

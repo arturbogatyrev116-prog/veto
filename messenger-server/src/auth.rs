@@ -7,6 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use sqlx::FromRow;
 use uuid::Uuid;
 
@@ -42,7 +43,8 @@ impl FromRequestParts<AppState> for AuthUser {
                 "SELECT t.user_id, t.session_id \
                  FROM auth_tokens t \
                  JOIN users u ON u.id = t.user_id \
-                 WHERE t.token_hash = $1 AND u.blocked = false",
+                 WHERE t.token_hash = $1 AND u.blocked = false \
+                 AND (t.expires_at IS NULL OR t.expires_at > now())",
             )
             .bind(token_hash.as_slice())
             .fetch_optional(&db)
@@ -100,7 +102,7 @@ impl FromRequestParts<AppState> for AdminAuth {
             }
             let token = token.ok_or(AppError::Unauthorized)?;
             let provided_hash: Vec<u8> = Sha256::digest(token.as_bytes()).to_vec();
-            if provided_hash == hash {
+            if provided_hash.ct_eq(&hash).into() {
                 Ok(AdminAuth)
             } else {
                 Err(AppError::Unauthorized)

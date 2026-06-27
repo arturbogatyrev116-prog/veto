@@ -191,7 +191,8 @@ impl RatchetState {
         while self.recv_count < until {
             let ck = self.chain_key_recv.as_ref().ok_or(CryptoError::DecryptionFailed)?;
             let (new_ck, mk) = kdf_ck(ck);
-            self.skipped.insert((self.dh_remote.unwrap_or([0; 32]), self.recv_count), mk);
+            let dh_key = self.dh_remote.ok_or(CryptoError::DecryptionFailed)?;
+            self.skipped.insert((dh_key, self.recv_count), mk);
             self.chain_key_recv = Some(new_ck);
             self.recv_count += 1;
         }

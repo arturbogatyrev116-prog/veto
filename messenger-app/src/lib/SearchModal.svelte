@@ -37,15 +37,20 @@
     if (e.key === 'Escape') close()
   }
 
-  // Format «matched» → highlighted span after HTML-escaping.
+  function escapeHtml(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  }
+
+  // Format «matched» → highlighted span. Splits on << >> markers BEFORE escaping
+  // each segment so we never convert escaped text back into raw HTML tags.
   function formatSnippet(raw) {
-    const escaped = raw
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-    return escaped
-      .replace(/&lt;&lt;/g, '<mark>')
-      .replace(/&gt;&gt;/g, '</mark>')
+    const parts = raw.split('<<')
+    return parts.map((part, i) => {
+      if (i === 0) return escapeHtml(part)
+      const idx = part.indexOf('>>')
+      if (idx === -1) return escapeHtml(part)
+      return '<mark>' + escapeHtml(part.slice(0, idx)) + '</mark>' + escapeHtml(part.slice(idx + 2))
+    }).join('')
   }
 
   function convName(hit) {
@@ -67,7 +72,7 @@
 
 {#if $showSearch}
 <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
-<div class="overlay" on:click|self={close} role="dialog" aria-modal="true">
+<div class="overlay" on:click|self={close} role="dialog" aria-modal="true" aria-label="Search messages">
   <div class="modal">
     <div class="header">
       <input
@@ -77,8 +82,9 @@
         placeholder="Search messages…"
         class="search-input"
         spellcheck="false"
+        aria-label="Search messages"
       />
-      <button class="close-btn" on:click={close} title="Close (Esc)">✕</button>
+      <button class="close-btn" on:click={close} aria-label="Close search">✕</button>
     </div>
 
     <div class="results">

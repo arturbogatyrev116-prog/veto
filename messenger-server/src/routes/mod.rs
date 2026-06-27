@@ -5,6 +5,8 @@ pub mod groups;
 pub mod health;
 pub mod polls;
 pub mod prekeys;
+pub mod push;
+pub mod refresh;
 pub mod register;
 pub mod sessions;
 pub mod translate;
@@ -27,6 +29,7 @@ pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/health", get(health::handler))
         .route("/api/v1/register", post(register::handler))
+        .route("/api/v1/auth/refresh", post(refresh::handler))
         .route("/api/v1/users/{user_id}/prekeys", put(prekeys::upload))
         .route("/api/v1/users/{user_id}/prekeys", get(prekeys::fetch))
         .route("/api/v1/users/{user_id}/opks", post(prekeys::upload_opks))
@@ -60,6 +63,8 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/api/v1/polls/{poll_id}", get(polls::get_one))
         .route("/api/v1/polls/{poll_id}/vote", post(polls::vote))
         .route("/api/v1/polls/{poll_id}/close", post(polls::close))
+        .route("/api/v1/push/register", post(push::register))
+        .route("/api/v1/push/unregister", post(push::unregister))
         .route("/api/v1/translate", post(translate::handler))
         .route("/ws", get(ws::handler))
         .layer(middleware::from_fn_with_state(state, auth::rate_limit))

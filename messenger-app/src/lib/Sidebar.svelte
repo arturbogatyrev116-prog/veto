@@ -330,7 +330,7 @@
       >
         {$wsStatus === 'connected' ? '●' : $wsStatus === 'lost' ? '✕' : '↻'}
       </span>
-      <button class="icon-btn" on:click={() => showSearch.set(true)} title="Search messages (Ctrl+F)">🔍</button>
+      <button class="icon-btn" on:click={() => showSearch.set(true)} title="Search messages (Ctrl+F)" aria-label="Search messages">🔍</button>
       <div class="theme-wrap">
         <button class="icon-btn" aria-label="Theme and accent colors" title="Theme & colors" on:click|stopPropagation={() => showThemeMenu = !showThemeMenu}>🎨</button>
         {#if showThemeMenu}
@@ -363,7 +363,7 @@
         {/if}
       </div>
       <button class="icon-btn" title="Settings" aria-label="Settings" on:click={() => showSettings = true}>⚙</button>
-      <button class="icon-btn logout-btn" on:click={logout} disabled={loggingOut} title="Sign out">⏻</button>
+      <button class="icon-btn logout-btn" on:click={logout} disabled={loggingOut} title="Sign out" aria-label="Sign out">⏻</button>
     </div>
   </div>
 
@@ -377,6 +377,7 @@
         maxlength="64"
         disabled={profileSaving}
         autofocus
+        aria-label="Display name"
       />
       <button type="submit" disabled={profileSaving || !profileDisplayName.trim()}>
         {profileSaving ? '…' : 'Save'}
@@ -393,6 +394,7 @@
       bind:this={searchEl}
       placeholder="Search (Ctrl+K)"
       class="search"
+      aria-label="Filter conversations"
       on:keydown={e => e.key === 'Escape' && (searchQuery = '')}
     />
   </div>
@@ -405,6 +407,7 @@
         bind:this={newChatEl}
         placeholder="Username or ID (Ctrl+N)"
         disabled={loading}
+        aria-label="Start chat — enter username or user ID"
       />
       <button type="submit" disabled={loading || !newPeerId.trim()}>+</button>
     </form>
@@ -476,7 +479,7 @@
   {#if Object.keys($groups).length > 0 || showNewGroup}
     <div class="section-header">
       <span class="section-label">Groups</span>
-      <button class="icon-btn" title="New group" on:click={() => showNewGroup = !showNewGroup}>#</button>
+      <button class="icon-btn" title="New group" aria-label="New group" on:click={() => showNewGroup = !showNewGroup}>#</button>
     </div>
     <ul>
       {#each Object.values($groups) as g}
@@ -564,14 +567,15 @@
   {/if}
 
   <div class="backup-row">
-    <button class="icon-btn" title="Manage devices" on:click={() => showDeviceManager = true}>🖥</button>
-    <button class="icon-btn" title="Chat statistics" on:click={() => showChatStats = true}>📊</button>
-    <button class="icon-btn" title="Backup identity" on:click={() => { showBackup = !showBackup; showRestore = false; backupStatus = '' }}>⬇</button>
-    <button class="icon-btn" title="Restore identity" on:click={() => { showRestore = !showRestore; showBackup = false; backupStatus = '' }}>⬆</button>
+    <button class="icon-btn" title="Manage devices" aria-label="Manage devices" on:click={() => showDeviceManager = true}>🖥</button>
+    <button class="icon-btn" title="Chat statistics" aria-label="Chat statistics" on:click={() => showChatStats = true}>📊</button>
+    <button class="icon-btn" title="Backup identity" aria-label="Backup identity" on:click={() => { showBackup = !showBackup; showRestore = false; backupStatus = '' }}>⬇</button>
+    <button class="icon-btn" title="Restore identity" aria-label="Restore identity" on:click={() => { showRestore = !showRestore; showBackup = false; backupStatus = '' }}>⬆</button>
     <button
       class="icon-btn"
       class:dnd-active={dndEnabled}
       title="Focus / Do Not Disturb"
+      aria-label={dndEnabled ? 'Do Not Disturb enabled' : 'Enable Do Not Disturb'}
       on:click={() => showDnd = !showDnd}
     >{dndEnabled ? '🔕' : '🌙'}</button>
   </div>
@@ -936,7 +940,6 @@
   aside.collapsed .backup-row { flex-direction: column; gap: 6px; }
 
   /* ── DND panel ───────────────────────────────────────────────────────────── */
-  .protected-on { color: var(--accent) !important; }
   .dnd-active { color: var(--accent) !important; }
   .dnd-panel {
     padding: 6px 10px 8px;

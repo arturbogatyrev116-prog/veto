@@ -31,7 +31,7 @@ hkdf             = "0.12"
 sha2             = "0.10"
 rand             = "0.8"
 argon2           = "0.5"
-rusqlite         = { version = "0.32", features = ["bundled-full"] }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 unicode-segmentation = "1.10"
 uuid                 = { version = "1", features = ["v4"] }
 tauri-plugin-notification = "2"
@@ -42,3 +42,7 @@ keyring          = "3"
 hex              = "0.4"
 scraper          = { version = "0.20", default-features = false }
 url              = "2"
+
+[features]
+default = ["sqlcipher"]
+sqlcipher = []

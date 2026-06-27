@@ -26,6 +26,7 @@
 //!   KDF info tag: "messenger-x3dh-v2" (v1 when no PQ).
 
 use x25519_dalek::PublicKey as X25519Public;
+use zeroize::ZeroizeOnDrop;
 
 use crate::{
     error::CryptoError,
@@ -38,7 +39,7 @@ const F: [u8; 32] = [0xff; 32];
 
 /// The shared secret produced by X3DH key agreement.
 /// 32 bytes, used to initialise the Double Ratchet.
-#[derive(Clone)]
+#[derive(Clone, ZeroizeOnDrop)]
 pub struct X3dhSecret(pub [u8; 32]);
 
 /// Header Alice sends to Bob so he can reconstruct the shared secret.

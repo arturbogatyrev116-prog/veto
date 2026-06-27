@@ -1,11 +1,16 @@
 use std::net::SocketAddr;
 
-use axum::{Router, extract::DefaultBodyLimit};
+use axum::{
+    http::{HeaderName, HeaderValue, Method},
+    Router,
+    extract::DefaultBodyLimit,
+};
 use axum_server::tls_rustls::RustlsConfig;
 use messenger_server::{routes, state::AppState};
 use rcgen::{CertificateParams, DistinguishedName, DnType};
 use sqlx::postgres::PgPoolOptions;
 use tower_http::{
+    cors::CorsLayer,
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     services::{ServeDir, ServeFile},
     trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer},
@@ -61,7 +66,29 @@ async fn main() {
     tracing::info!("connected to NATS JetStream");
 
     let state = AppState::new(db, nats_client.clone(), js);
-    let request_id_header = axum::http::HeaderName::from_static(REQUEST_ID_HEADER);
+    let request_id_header = HeaderName::from_static(REQUEST_ID_HEADER);
+
+    // CORS — only allow the Tauri app origin (and optional override via CORS_ALLOWED_ORIGIN).
+    // The desktop client uses tauri://localhost (macOS/Linux) or https://tauri.localhost (Windows).
+    let cors = {
+        let mut allowed: Vec<HeaderValue> = vec![
+            "tauri://localhost".parse().unwrap(),
+            "https://tauri.localhost".parse().unwrap(),
+        ];
+        if let Ok(extra) = std::env::var("CORS_ALLOWED_ORIGIN") {
+            if let Ok(v) = extra.parse::<HeaderValue>() {
+                allowed.push(v);
+            }
+        }
+        CorsLayer::new()
+            .allow_origin(allowed)
+            .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::PUT, Method::DELETE])
+            .allow_headers([
+                axum::http::header::CONTENT_TYPE,
+                axum::http::header::AUTHORIZATION,
+            ])
+            .allow_credentials(false)
+    };
 
     // Serve admin UI static files. Falls back to index.html for SPA routing.
     let admin_ui_dir = std::env::var("ADMIN_UI_DIR")
@@ -70,6 +97,7 @@ async fn main() {
 
     let app = Router::new()
         .merge(routes::router(state.clone()))
+        .layer(cors)
         .layer(DefaultBodyLimit::max(20 * 1024 * 1024))
         .nest_service(
             "/admin",
