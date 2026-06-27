@@ -49,6 +49,10 @@ pub struct IdentityState {
     pub user_id: String,
     pub username: String,
     pub token: String,
+    /// Refresh token for obtaining new short-lived access tokens.
+    pub refresh_token: String,
+    /// Unix ms expiry of `token`. 0 = no expiry (pre-refresh-token installations).
+    pub token_expires_at: i64,
     /// Raw bytes — reconstructed into crypto types on demand so we don't need
     /// to worry about Send/Sync bounds on ZeroizeOnDrop key types.
     pub signing_key_bytes: [u8; 32],
@@ -106,11 +110,17 @@ pub struct AppState {
     pub server_url: String,
     /// Context stored when showing a native popup context menu; read by on_menu_event handler.
     pub ctx_menu_context: Mutex<Option<commands::CtxMenuContext>>,
+    /// In-memory FTS5 SQLite DB, built at unlock, dropped at lock.
+    pub fts_db: Mutex<Option<rusqlite::Connection>>,
 }
 
 impl AppState {
     fn new(server_url: String) -> Self {
-        let accept_invalid_certs = std::env::var("MESSENGER_INSECURE_TLS").is_ok();
+        let accept_invalid_certs = if cfg!(debug_assertions) {
+            std::env::var("MESSENGER_INSECURE_TLS").is_ok()
+        } else {
+            false
+        };
         let http = reqwest::Client::builder()
             .no_proxy()
             .danger_accept_invalid_certs(accept_invalid_certs)
@@ -133,6 +143,7 @@ impl AppState {
             http,
             server_url,
             ctx_menu_context: Mutex::new(None),
+            fts_db: Mutex::new(None),
         }
     }
 }
@@ -319,6 +330,7 @@ pub fn run() {
             commands::group_has_sender_key,
             commands::send_group_file,
             commands::get_group_messages,
+            commands::get_thread_messages,
             commands::leave_group,
             commands::set_member_role,
             commands::kick_member,
@@ -368,6 +380,7 @@ pub fn run() {
             commands::save_biometric_unlock,
             commands::delete_biometric_unlock,
             commands::try_biometric_unlock,
+            commands::refresh_token,
             commands::create_poll,
             commands::get_poll,
             commands::vote_poll,
@@ -378,6 +391,8 @@ pub fn run() {
             commands::fetch_link_preview,
             commands::set_retention,
             commands::get_retention,
+            commands::register_push_token,
+            commands::unregister_push_token,
             install_update,
         ])
         .run(tauri::generate_context!())

@@ -3,6 +3,7 @@
   import { listen } from '@tauri-apps/api/event'
   import { tick, onMount, onDestroy } from 'svelte'
   import { marked } from 'marked'
+  import DOMPurify from 'dompurify'
   import hljs from 'highlight.js'
   import { conversations, activeConv, user, peerNames, typingPeers, addMessage, addGroupMessage, removeMessage, onlinePeers, unlocked, groups, unreadCounts, reactions, showSearch, channels, chatBg, CHAT_GRADIENTS } from '../stores.js'
   import Avatar from './Avatar.svelte'
@@ -14,6 +15,7 @@
   import StickerPicker from './StickerPicker.svelte'
   import GroupEventModal from './GroupEventModal.svelte'
   import LinkPreviewCard from './LinkPreviewCard.svelte'
+  import ThreadPane from './ThreadPane.svelte'
 
   export let peerId
   export let onToggleSidebar = null
@@ -42,6 +44,7 @@
   $: if (peerId !== prevPeerId && $unlocked) {
     if (prevPeerId) saveDraft(prevPeerId, text)
     prevPeerId = peerId
+    openThread = null
     invoke('get_draft', { peerId }).then(d => { text = d }).catch(() => {})
   }
 
@@ -275,6 +278,9 @@
   let userScrolledUp = false
   // Reply-to state: { ts, from, peerName, text } | null
   let replyTo = null
+
+  // Thread pane: { ts, from, text } of the parent message, or null when closed
+  let openThread = null
 
   // Lightbox: URL of full-res image to show, or null
   let lightboxUrl = null
@@ -556,8 +562,13 @@
   }
   marked.setOptions({ breaks: true, gfm: true, renderer })
 
+  const PURIFY_OPTS = {
+    ALLOWED_TAGS: ['strong','em','del','code','pre','br','p','ul','ol','li','blockquote','a','h1','h2','h3','h4','span','mark'],
+    ALLOWED_ATTR: ['class','href'],
+  }
+
   function renderMd(raw) {
-    return marked.parse(raw ?? '')
+    return DOMPurify.sanitize(marked.parse(raw ?? ''), PURIFY_OPTS)
   }
 
   $: isSaved = peerId === '__saved__'
@@ -1463,10 +1474,11 @@
 
 <svelte:window
   on:click={() => { showMoreMenu = false; showStickerPicker = false; showAttachMenu = false; sendMenuOpen = false }}
-  on:keydown={e => e.key === 'Escape' && (showMoreMenu = false, showSlashPalette = false, showMentionPicker = false, cancelEdit(), showEditHistory = null, pickerVisible = {}, showStickerPicker = false, showAttachMenu = false, showEventModal = false, showScheduleModal = false, sendMenuOpen = false, showHelpModal = false)}
+  on:keydown={e => e.key === 'Escape' && (showMoreMenu = false, showSlashPalette = false, showMentionPicker = false, cancelEdit(), showEditHistory = null, pickerVisible = {}, showStickerPicker = false, showAttachMenu = false, showEventModal = false, showScheduleModal = false, sendMenuOpen = false, showHelpModal = false, openThread = null)}
 />
 
-<div class="pane">
+<div class="pane" class:thread-open={openThread !== null}>
+<div class="pane-main">
   <div class="header">
     {#if onToggleSidebar}
       <button class="burger-btn" on:click={onToggleSidebar} aria-label="Open sidebar">☰</button>
@@ -1510,6 +1522,7 @@
       <button
         class="safety-btn"
         title="Verify safety number"
+        aria-label="Verify safety number"
         on:click={() => showSafetyNumbers = true}
       >🔒</button>
     {/if}
@@ -1622,7 +1635,7 @@
 
   <!-- Scheduled messages banner -->
   {#if scheduledMsgs.length > 0}
-    <div class="sched-banner" on:click={() => showScheduledList = !showScheduledList} role="button" tabindex="0" on:keydown={e => e.key === 'Enter' && (showScheduledList = !showScheduledList)}>
+    <div class="sched-banner" on:click={() => showScheduledList = !showScheduledList} role="button" tabindex="0" aria-expanded={showScheduledList} on:keydown={e => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), showScheduledList = !showScheduledList)}>
       🕐 {scheduledMsgs.length} scheduled {scheduledMsgs.length === 1 ? 'message' : 'messages'}
       <span class="sched-chevron">{showScheduledList ? '▲' : '▼'}</span>
     </div>
@@ -1632,7 +1645,7 @@
           <div class="sched-item">
             <span class="sched-time">{fmtScheduledTime(sm.send_at_ms)}</span>
             <span class="sched-text">{sm.text.length > 55 ? sm.text.slice(0, 55) + '…' : sm.text}</span>
-            <button class="sched-cancel-btn" title="Cancel" on:click|stopPropagation={() => cancelScheduled(sm.id)}>✕</button>
+            <button class="sched-cancel-btn" title="Cancel scheduled message" aria-label="Cancel scheduled message" on:click|stopPropagation={() => cancelScheduled(sm.id)}>✕</button>
           </div>
         {/each}
       </div>
@@ -1900,6 +1913,14 @@
               </div>
             {/if}
           {/if}
+
+          {#if isGroup && !m.thread_parent_ts && m.thread_reply_count > 0}
+            <button
+              class="thread-count-badge"
+              on:click={() => openThread = { ts: m.ts, from: m.from ?? m.sender_id, text: m.text }}
+              title="View thread"
+            >↳ {m.thread_reply_count} {m.thread_reply_count === 1 ? 'reply' : 'replies'}</button>
+          {/if}
         </div>
 
         <div class="msg-actions">
@@ -1913,6 +1934,14 @@
               text: m.text,
             }}
           >↩</button>
+          {#if isGroup && !m.thread_parent_ts}
+            <button
+              class="thread-btn"
+              title="Reply in thread"
+              aria-label="Reply in thread"
+              on:click={() => openThread = { ts: m.ts, from: m.from ?? m.sender_id, text: m.text }}
+            >↳</button>
+          {/if}
           {#if mine && !m.file_id && !m.sticker && !m.location && !m.event_data && !m.rsvp}
             <button
               class="edit-btn"
@@ -1943,7 +1972,7 @@
   </div>
 
   {#if showScrollBtn}
-    <button class="scroll-btn" on:click={scrollBottom} title="Scroll to bottom">↓</button>
+    <button class="scroll-btn" on:click={scrollBottom} title="Scroll to bottom" aria-label="Scroll to bottom">↓</button>
   {/if}
   </div>
 
@@ -2084,7 +2113,7 @@
       {/if}
     </button>
     {#if recState === 'voice-locked'}
-      <button type="button" class="rec-stop-btn" on:click={() => { clearInterval(recTicker); recTicker = null; stopAndSendVoice(false) }}>
+      <button type="button" class="rec-stop-btn" aria-label="Send recording" on:click={() => { clearInterval(recTicker); recTicker = null; stopAndSendVoice(false) }}>
         <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
       </button>
     {/if}
@@ -2108,7 +2137,7 @@
           <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
         </button>
         {#if sendMenuOpen}
-          <div class="send-ctx-menu" role="menu" on:click|stopPropagation>
+          <div class="send-ctx-menu" role="menu" tabindex="0" on:click|stopPropagation on:keydown|stopPropagation>
             <button role="menuitem" on:click={() => { sendMenuOpen = false; send() }}>
               <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
               Send now
@@ -2127,9 +2156,19 @@
   {/if}
 </div>
 
+{#if openThread}
+  <ThreadPane
+    groupId={peerId}
+    parentMsg={openThread}
+    onClose={() => openThread = null}
+  />
+{/if}
+</div>
+
 {#if showHelpModal}
-  <div class="help-overlay" role="dialog" aria-modal="true" on:click|self={() => showHelpModal = false}>
-    <div class="help-box">
+  <!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
+  <div class="help-overlay" role="none" on:click|self={() => showHelpModal = false} on:keydown|self={e => e.key === 'Escape' && (showHelpModal = false)}>
+    <div class="help-box" role="dialog" aria-modal="true" aria-label="Slash command reference">
       <div class="help-hdr">
         <span>Slash commands</span>
         <button class="help-close" on:click={() => showHelpModal = false} aria-label="Close">✕</button>
@@ -2150,21 +2189,21 @@
 
 {#if lightboxUrl}
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
-  <div class="lightbox-overlay" role="dialog" aria-modal="true"
+  <div class="lightbox-overlay" role="dialog" aria-modal="true" aria-label="Image viewer"
     on:click={() => { URL.revokeObjectURL(lightboxUrl); lightboxUrl = null }}
     on:keydown={e => { if (e.key === 'Escape') { URL.revokeObjectURL(lightboxUrl); lightboxUrl = null } }}>
     <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
     <img class="lightbox-img" src={lightboxUrl} alt="full size" on:click|stopPropagation />
-    <button class="lightbox-close" on:click={() => { URL.revokeObjectURL(lightboxUrl); lightboxUrl = null }}>✕</button>
+    <button class="lightbox-close" aria-label="Close image" on:click={() => { URL.revokeObjectURL(lightboxUrl); lightboxUrl = null }}>✕</button>
   </div>
 {/if}
 
 <!-- Poll creation modal -->
 {#if showPollModal}
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
-  <div class="modal-overlay" role="dialog" aria-modal="true" on:click|self={() => showPollModal = false}>
+  <div class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="poll-modal-title" on:click|self={() => showPollModal = false}>
     <div class="modal-box poll-modal" role="document" on:keydown={trapFocus}>
-      <div class="modal-title">Create Poll</div>
+      <div class="modal-title" id="poll-modal-title">Create Poll</div>
       <input
         class="modal-input"
         type="text"
@@ -2206,9 +2245,9 @@
 <!-- Export chat dialog -->
 {#if showExport}
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
-  <div class="modal-overlay" role="dialog" aria-modal="true" on:click|self={() => showExport = false}>
+  <div class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="export-modal-title" on:click|self={() => showExport = false}>
     <div class="modal-box" role="document" on:keydown={trapFocus}>
-      <div class="modal-title">Export chat</div>
+      <div class="modal-title" id="export-modal-title">Export chat</div>
       <label class="modal-label">Format
         <select bind:value={exportFormat}>
           <option value="markdown">Markdown</option>
@@ -2235,9 +2274,9 @@
 <!-- Edit history modal -->
 {#if showEditHistory}
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
-  <div class="modal-overlay" role="dialog" aria-modal="true" on:click|self={() => showEditHistory = null}>
+  <div class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="edit-history-title" on:click|self={() => showEditHistory = null}>
     <div class="modal-box" role="document" on:keydown={trapFocus}>
-      <div class="modal-title">Edit history</div>
+      <div class="modal-title" id="edit-history-title">Edit history</div>
       {#if showEditHistory.history.length === 0}
         <p class="modal-empty">No history yet.</p>
       {:else}
@@ -2270,9 +2309,9 @@
 <!-- C6 Schedule modal -->
 {#if showScheduleModal && !isSaved}
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
-  <div class="modal-overlay" on:click|self={() => showScheduleModal = false} role="dialog" aria-modal="true">
+  <div class="modal-overlay" on:click|self={() => showScheduleModal = false} role="dialog" aria-modal="true" aria-labelledby="schedule-modal-title">
     <div class="modal-box" role="document" on:keydown={trapFocus}>
-      <div class="modal-title">🕐 Schedule Message</div>
+      <div class="modal-title" id="schedule-modal-title">🕐 Schedule Message</div>
       <div class="sched-preview">{text.trim() || '(type a message first)'}</div>
       <input
         type="datetime-local"
@@ -2291,9 +2330,9 @@
 <!-- Video recording modal -->
 {#if showVideoModal}
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
-  <div class="modal-overlay video-modal-overlay" role="dialog" aria-modal="true" on:click|self={() => closeVideoModal(true)}>
+  <div class="modal-overlay video-modal-overlay" role="dialog" aria-modal="true" aria-labelledby="video-modal-title" on:click|self={() => closeVideoModal(true)}>
     <div class="video-modal-box">
-      <div class="video-modal-title">Video message</div>
+      <div class="video-modal-title" id="video-modal-title">Video message</div>
       <!-- svelte-ignore a11y-media-has-caption -->
       <video
         class="video-preview"
@@ -2970,18 +3009,6 @@
 
   /* ── Popovers ─────────────────────────────────────────────────────────────── */
   .popover-wrap { position: relative; }
-  .popover {
-    position: absolute; top: calc(100% + 4px); right: 0; z-index: 50;
-    background: var(--bg-2, #1e1e2e); border: 1px solid var(--border, #313244);
-    border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.4);
-    min-width: 140px; padding: 4px;
-  }
-  .pop-item {
-    display: block; width: 100%; background: none; color: var(--text);
-    text-align: left; padding: 7px 12px; font-size: 12px; border-radius: 4px; cursor: pointer;
-  }
-  .pop-item:hover { background: var(--bg-hover); }
-  .pop-item.selected { color: var(--accent); font-weight: 600; }
 
   /* ── TTL banners ──────────────────────────────────────────────────────────── */
   .ttl-banner {
@@ -3475,4 +3502,42 @@
     line-height: 1;
   }
   .translate-btn:hover { opacity: 1; background: var(--bg-hover); }
+
+  /* ── Thread layout ───────────────────────────────────────────────────────── */
+  .pane.thread-open {
+    flex-direction: row;
+  }
+  .pane-main {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .thread-btn {
+    background: none;
+    border: none;
+    color: var(--accent, #7c6af7);
+    cursor: pointer;
+    font-size: 13px;
+    padding: 2px 5px;
+    border-radius: 4px;
+    opacity: 0.7;
+    line-height: 1;
+  }
+  .thread-btn:hover { opacity: 1; background: var(--bg-hover); }
+  .thread-count-badge {
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: var(--accent, #7c6af7);
+    font-size: 12px;
+    padding: 2px 6px;
+    border-radius: 10px;
+    border: 1px solid var(--accent, #7c6af7);
+    opacity: 0.8;
+    margin-top: 4px;
+    align-self: flex-start;
+  }
+  .thread-count-badge:hover { opacity: 1; background: rgba(124,106,247,0.1); }
 </style>

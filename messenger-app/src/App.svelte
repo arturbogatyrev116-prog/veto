@@ -134,7 +134,8 @@
     // Register listeners BEFORE connect() so no events are missed
     const unlistenGroupMsg = await listen('group_message', ({ payload }) => {
       const { gid, from, text, ts, reply_to_ts, reply_to_from, reply_to_text,
-              file_id, file_key, file_name, file_mime, file_size, thumb_data } = payload
+              file_id, file_key, file_name, file_mime, file_size, thumb_data,
+              thread_parent_ts, thread_parent_from } = payload
       addGroupMessage(gid, {
         from,
         text,
@@ -151,6 +152,9 @@
         file_mime: file_mime ?? null,
         file_size: file_size ?? null,
         thumb_data: thumb_data ?? null,
+        thread_parent_ts: thread_parent_ts ?? null,
+        thread_parent_from: thread_parent_from ?? null,
+        thread_reply_count: 0,
       })
       let ac; activeConv.subscribe(v => { ac = v })()
       if (ac !== gid) {
@@ -311,6 +315,19 @@
       setTimeout(() => { ktWarning = '' }, 12000)
     })
 
+    // Mobile push notification token registration.
+    // The native push plugin emits this event after obtaining a device token from
+    // FCM (Android) or APNs (iOS). We forward it to the server so offline push
+    // notifications can be delivered when the user is disconnected from the WS.
+    const unlistenPush = await listen('push_token_received', ({ payload }) => {
+      const { platform, token } = payload ?? {}
+      if (platform && token) {
+        invoke('register_push_token', { platform, token }).catch(e =>
+          console.warn('push token registration failed:', e)
+        )
+      }
+    })
+
     try {
       const info = await invoke('load_identity')
       if (info) {
@@ -326,7 +343,7 @@
       clearTimeout(reconnectTimer)
       unlistenMsg(); unlistenGroupMsg(); unlistenConn(); unlistenErr(); unlistenDelivered(); unlistenTyping()
       unlistenRead(); unlistenHello(); unlistenPresence(); unlistenReaction(); unlistenUpdate()
-      unlistenMemberLeft(); unlistenKt(); unlistenMention()
+      unlistenMemberLeft(); unlistenKt(); unlistenMention(); unlistenPush()
       Object.values(typingTimers).forEach(clearTimeout)
       Object.values(receiptTimers).forEach(clearTimeout)
     }

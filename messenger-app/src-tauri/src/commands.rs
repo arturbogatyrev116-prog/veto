@@ -82,6 +82,12 @@ pub struct MessageView {
     pub group_id: Option<String>,
     /// For group messages: the sender's user_id (needed to show "from" in group view).
     pub sender_id: Option<String>,
+    /// If this message is a thread reply: the ts of the parent message.
+    pub thread_parent_ts: Option<i64>,
+    /// If this message is a thread reply: the sender_id of the parent message.
+    pub thread_parent_from: Option<String>,
+    /// Number of thread replies to this message (0 if not a thread parent).
+    pub thread_reply_count: i64,
 }
 
 /// Encode the wire payload as JSON v1, always including the sender's timestamp.
@@ -107,9 +113,17 @@ fn encode_payload(text: &str, ts: i64, reply_to: Option<&ReplyInfo>, mentions: O
 #[tauri::command]
 pub async fn load_identity(app: AppHandle) -> Result<Option<UserInfo>, String> {
     let data_dir = store::data_dir(&app)?;
-    let path = data_dir.join("identity.json");
+    let bin_path = data_dir.join("identity.bin");
+    let json_path = data_dir.join("identity.json");
 
-    let Some(stored) = store::load(&path).await else {
+    let stored = if let Some(s) = store::load_identity(&bin_path).await {
+        s
+    } else if let Some(s) = store::load_legacy(&json_path).await {
+        // Migrate: re-encrypt and remove plaintext file.
+        store::save_identity(&bin_path, &s).await.ok();
+        tokio::fs::remove_file(&json_path).await.ok();
+        s
+    } else {
         return Ok(None);
     };
 
@@ -125,7 +139,14 @@ pub async fn register(username: String, app: AppHandle) -> Result<UserInfo, Stri
     let state = app.state::<AppState>();
 
     #[derive(serde::Deserialize)]
-    struct Resp { user_id: String, token: String }
+    struct Resp {
+        user_id: String,
+        token: String,
+        #[serde(default)]
+        refresh_token: String,
+        #[serde(default)]
+        expires_at_ms: i64,
+    }
 
     let data_dir = store::data_dir(&app)?;
     let device_id = store::get_or_create_device_id(&data_dir);
@@ -213,6 +234,8 @@ pub async fn register(username: String, app: AppHandle) -> Result<UserInfo, Stri
         user_id: resp.user_id.clone(),
         username: username.clone(),
         token: resp.token,
+        refresh_token: resp.refresh_token,
+        token_expires_at: resp.expires_at_ms,
         signing_key: signing_key_bytes,
         spk_secret: spk_secret_bytes,
         spk_rotation_ts: store::now_ms(),
@@ -222,7 +245,7 @@ pub async fn register(username: String, app: AppHandle) -> Result<UserInfo, Stri
         pq_spk_secret: pq_dk_bytes,
     };
 
-    store::save(&data_dir.join("identity.json"), &stored)
+    store::save_identity(&data_dir.join("identity.bin"), &stored)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -267,17 +290,16 @@ pub async fn unlock(password: String, app: AppHandle) -> Result<bool, String> {
     *state.session_key.lock().unwrap() = Some(key);
 
     // Open message history DB (created if it doesn't exist yet).
-    let conn = db::open(&dir)?;
+    let conn = db::open(&dir, &key)?;
     // Initialise msg counter above the highest smid stored so cross-restart
     // collisions cannot cause a stale ACK to update the wrong DB row.
     let max = db::max_smid(&conn);
     state.msg_counter.store(max + 1, Ordering::Relaxed);
 
-    // One-time FTS backfill: fill `plain` for messages stored before this migration.
-    // Runs before putting `conn` into state — exclusive access, no locking needed.
-    // Idempotent: skips rows that already have `plain` set.
-    let key_bf = key;
-    db::backfill_fts(&conn, move |nonce, ct| store::decrypt_content(nonce, ct, &key_bf).ok());
+    // Build in-memory FTS index from decrypted message ciphertext.
+    let fts = db::create_fts_db();
+    db::build_fts_index(&conn, &fts, &key).ok();
+    *state.fts_db.lock().unwrap() = Some(fts);
 
     // Retry failed scheduled messages within 60 s grace window (sent while offline).
     db::retry_failed_scheduled(&conn, 60_000);
@@ -314,14 +336,116 @@ pub async fn unlock(password: String, app: AppHandle) -> Result<bool, String> {
     // Wake scheduler in case messages were just re-queued by retry_failed_scheduled.
     SCHED_WAKEUP.notify_one();
 
+    // Proactively refresh access token if it expires within 1 hour.
+    let (needs_refresh, refresh_tok) = {
+        let guard = state.identity.lock().unwrap();
+        if let Some(id) = guard.as_ref() {
+            let needs = id.token_expires_at > 0
+                && store::now_ms() + 3_600_000 > id.token_expires_at
+                && !id.refresh_token.is_empty();
+            (needs, id.refresh_token.clone())
+        } else {
+            (false, String::new())
+        }
+    };
+    if needs_refresh {
+        if let Ok(resp) = state
+            .http
+            .post(format!("{}/api/v1/auth/refresh", state.server_url))
+            .json(&serde_json::json!({ "refresh_token": refresh_tok }))
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+        {
+            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                let new_tok     = body["token"].as_str().unwrap_or_default().to_string();
+                let new_refresh = body["refresh_token"].as_str().unwrap_or_default().to_string();
+                let new_expires = body["expires_at_ms"].as_i64().unwrap_or(0);
+                if !new_tok.is_empty() {
+                    // Update in-memory identity state.
+                    {
+                        let mut guard = state.identity.lock().unwrap();
+                        if let Some(ref mut id) = *guard {
+                            id.token = new_tok.clone();
+                            id.refresh_token = new_refresh.clone();
+                            id.token_expires_at = new_expires;
+                        }
+                    }
+                    // Persist updated tokens to identity.bin.
+                    let bin = dir.join("identity.bin");
+                    if let Some(mut stored) = store::load_identity(&bin).await {
+                        stored.token = new_tok;
+                        stored.refresh_token = new_refresh;
+                        stored.token_expires_at = new_expires;
+                        store::save_identity(&bin, &stored).await.ok();
+                    }
+                }
+            }
+        }
+    }
+
     Ok(restored)
+}
+
+// ── refresh_token command ─────────────────────────────────────────────────────
+
+/// Explicitly refresh the access token using the stored refresh token.
+/// Called by the UI when a request fails with 401 or when the token is near expiry.
+#[tauri::command]
+pub async fn refresh_token(app: AppHandle) -> Result<(), String> {
+    let dir = store::data_dir(&app)?;
+    let state = app.state::<AppState>();
+
+    let (refresh_tok, server_url) = {
+        let guard = state.identity.lock().unwrap();
+        let id = guard.as_ref().ok_or("not registered")?;
+        if id.refresh_token.is_empty() {
+            return Err("no refresh token stored".into());
+        }
+        (id.refresh_token.clone(), state.server_url.clone())
+    };
+
+    let resp = state
+        .http
+        .post(format!("{server_url}/api/v1/auth/refresh"))
+        .json(&serde_json::json!({ "refresh_token": refresh_tok }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|_| "refresh token expired or revoked — please re-login".to_string())?;
+
+    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let new_tok     = body["token"].as_str().ok_or("missing token in refresh response")?.to_string();
+    let new_refresh = body["refresh_token"].as_str().unwrap_or_default().to_string();
+    let new_expires = body["expires_at_ms"].as_i64().unwrap_or(0);
+
+    // Update in-memory identity state.
+    {
+        let mut guard = state.identity.lock().unwrap();
+        if let Some(ref mut id) = *guard {
+            id.token = new_tok.clone();
+            id.refresh_token = new_refresh.clone();
+            id.token_expires_at = new_expires;
+        }
+    }
+    // Persist updated tokens to identity.bin.
+    let bin = dir.join("identity.bin");
+    if let Some(mut stored) = store::load_identity(&bin).await {
+        stored.token = new_tok;
+        stored.refresh_token = new_refresh;
+        stored.token_expires_at = new_expires;
+        store::save_identity(&bin, &stored).await.map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
 }
 
 // ── connect ───────────────────────────────────────────────────────────────────
 
 #[tauri::command]
 pub async fn connect(app: AppHandle) -> Result<(), String> {
-    let ws_url = {
+    let (ws_url, ws_token) = {
         let state = app.state::<AppState>();
         let guard = state.identity.lock().unwrap();
         let id = guard.as_ref().ok_or("not registered")?;
@@ -329,7 +453,7 @@ pub async fn connect(app: AppHandle) -> Result<(), String> {
             .server_url
             .replacen("https://", "wss://", 1)
             .replacen("http://", "ws://", 1);
-        format!("{base}/ws?token={}", id.token)
+        (format!("{base}/ws"), id.token.clone())
     };
 
     // Build a TLS connector; accept_invalid_certs=true allows self-signed certs (LAN dev).
@@ -370,7 +494,7 @@ pub async fn connect(app: AppHandle) -> Result<(), String> {
 
     *app.state::<AppState>().ws_tx.lock().unwrap() = Some(out_tx);
 
-    tokio::spawn(client::ws_loop(ws_stream, app.clone(), out_rx));
+    tokio::spawn(client::ws_loop(ws_stream, app.clone(), out_rx, ws_token));
 
     // Check SPK age in background — doesn't block WS startup.
     tokio::spawn(rotate_spk_if_needed(app.clone()));
@@ -719,12 +843,15 @@ pub async fn send_message(
         let (nonce, ct) = store::encrypt_content(&text, key);
         let db = state.db.lock().unwrap();
         if let Some(ref conn) = *db {
-            let _ = db::insert_sent(
+            if let Ok(rowid) = db::insert_sent(
                 conn, &peer_id, ts, &nonce, &ct, msg_id,
                 r_ts, r_from.as_deref(), r_text.as_deref(),
-                None, None, None, None,
-                Some(text.as_str()), None,
-            );
+                None, None, None, None, None,
+            ) {
+                if let Some(fts) = state.fts_db.lock().unwrap().as_ref() {
+                    db::fts_insert(fts, rowid, &text);
+                }
+            }
         }
     }
 
@@ -811,6 +938,9 @@ pub fn get_messages(
                             thumb_data: row.thumb_data,
                             group_id: row.group_id,
                             sender_id: row.sender_id,
+                            thread_parent_ts: row.thread_parent_ts,
+                            thread_parent_from: row.thread_parent_from,
+                            thread_reply_count: row.thread_reply_count,
                         });
                     }
                     Err(e) => tracing::warn!("skipping undecryptable file message: {e}"),
@@ -837,6 +967,9 @@ pub fn get_messages(
                             thumb_data: None,
                             group_id: row.group_id,
                             sender_id: row.sender_id,
+                            thread_parent_ts: row.thread_parent_ts,
+                            thread_parent_from: row.thread_parent_from,
+                            thread_reply_count: row.thread_reply_count,
                         });
                     }
                     Err(e) => tracing::warn!("skipping undecryptable stored message: {e}"),
@@ -1011,7 +1144,6 @@ pub async fn send_file(
                 Some(file_name.as_str()),
                 Some(mime_type.as_str()),
                 Some(file_size),
-                Some(file_name.as_str()),
                 thumb_plain.as_deref(),
             );
         }
@@ -1226,9 +1358,9 @@ pub fn get_group_read_marks(
 #[tauri::command]
 pub async fn export_identity(password: String, app: AppHandle) -> Result<Vec<u8>, String> {
     let dir = store::data_dir(&app)?;
-    let identity_bytes = tokio::fs::read(dir.join("identity.json"))
-        .await
-        .map_err(|_| "identity not found — register first")?;
+    let stored = store::load_identity(&dir.join("identity.bin")).await
+        .ok_or("identity not found — register first")?;
+    let identity_bytes = serde_json::to_vec(&stored).map_err(|e| e.to_string())?;
 
     let mut salt = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut salt);
@@ -1289,7 +1421,7 @@ pub async fn import_identity(
         serde_json::from_slice(&plaintext).map_err(|e| format!("invalid backup content: {e}"))?;
 
     let dir = store::data_dir(&app)?;
-    store::save(&dir.join("identity.json"), &stored)
+    store::save_identity(&dir.join("identity.bin"), &stored)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -1323,6 +1455,7 @@ pub async fn import_identity(
 pub async fn clear_identity(app: AppHandle) -> Result<(), String> {
     let dir = store::data_dir(&app)?;
     tokio::fs::remove_file(dir.join("identity.json")).await.ok();
+    tokio::fs::remove_file(dir.join("identity.bin")).await.ok();
     tokio::fs::remove_file(dir.join("sessions.bin")).await.ok();
     tokio::fs::remove_file(dir.join("sessions.bin.tmp")).await.ok();
     tokio::fs::remove_file(dir.join("sessions.salt")).await.ok();
@@ -1334,6 +1467,7 @@ pub async fn clear_identity(app: AppHandle) -> Result<(), String> {
     *state.ws_tx.lock().unwrap() = None;
     *state.session_key.lock().unwrap() = None;
     *state.db.lock().unwrap() = None;
+    *state.fts_db.lock().unwrap() = None;
     state.sessions.lock().unwrap().clear();
     state.outgoing_queue.lock().unwrap().clear();
     state.pending_receipts.lock().unwrap().clear();
@@ -1348,6 +1482,8 @@ fn populate_app_state(app: &AppHandle, stored: &StoredIdentity) {
         user_id: stored.user_id.clone(),
         username: stored.username.clone(),
         token: stored.token.clone(),
+        refresh_token: stored.refresh_token.clone(),
+        token_expires_at: stored.token_expires_at,
         signing_key_bytes: stored.signing_key,
         spk_secret_bytes: stored.spk_secret,
         spk_id: stored.spk_id,
@@ -1431,16 +1567,15 @@ async fn rotate_spk_if_needed(app: AppHandle) {
                     id.pq_spk_secret_bytes = pq_dk_bytes.clone();
                 }
             }
-            // Persist to disk: read → patch → write.
+            // Persist to disk: load → patch → save.
             let Ok(dir) = store::data_dir(&app) else { return };
-            let path = dir.join("identity.json");
-            let Ok(bytes) = tokio::fs::read(&path).await else { return };
-            let Ok(mut stored) = serde_json::from_slice::<store::StoredIdentity>(&bytes) else { return };
+            let path = dir.join("identity.bin");
+            let Some(mut stored) = store::load_identity(&path).await else { return };
             stored.spk_id = new_spk_id;
             stored.spk_secret = spk_secret_bytes;
             stored.spk_rotation_ts = rotation_ts;
             stored.pq_spk_secret = pq_dk_bytes;
-            if let Err(e) = store::save(&path, &stored).await {
+            if let Err(e) = store::save_identity(&path, &stored).await {
                 tracing::error!("SPK rotation save: {e}");
             } else {
                 tracing::info!(new_spk_id, "SPK rotated");
@@ -1505,12 +1640,11 @@ async fn replenish_opks_if_needed(app: AppHandle) {
                 }
             }
             let Ok(dir) = store::data_dir(&app) else { return };
-            let path = dir.join("identity.json");
-            let Ok(bytes) = tokio::fs::read(&path).await else { return };
-            let Ok(mut stored) = serde_json::from_slice::<store::StoredIdentity>(&bytes) else { return };
+            let path = dir.join("identity.bin");
+            let Some(mut stored) = store::load_identity(&path).await else { return };
             stored.opk_secrets.extend_from_slice(&new_secrets);
             stored.opk_next_id = new_next_id;
-            if let Err(e) = store::save(&path, &stored).await {
+            if let Err(e) = store::save_identity(&path, &stored).await {
                 tracing::error!("OPK replenish save: {e}");
             } else {
                 tracing::info!(new_next_id, "OPK pool replenished");
@@ -1522,7 +1656,15 @@ async fn replenish_opks_if_needed(app: AppHandle) {
 
 // ── Group helpers ─────────────────────────────────────────────────────────────
 
-fn encode_group_payload(text: &str, ts: i64, group_id: &str, reply_to: Option<&ReplyInfo>, mentions: Option<&[String]>) -> String {
+fn encode_group_payload(
+    text: &str,
+    ts: i64,
+    group_id: &str,
+    reply_to: Option<&ReplyInfo>,
+    mentions: Option<&[String]>,
+    thread_parent_ts: Option<i64>,
+    thread_parent_from: Option<&str>,
+) -> String {
     let mut obj = serde_json::json!({ "v": 1, "text": text, "ts": ts, "gid": group_id });
     if let Some(r) = reply_to {
         let quoted: String = if r.text.chars().count() > 100 {
@@ -1534,6 +1676,10 @@ fn encode_group_payload(text: &str, ts: i64, group_id: &str, reply_to: Option<&R
     }
     if let Some(m) = mentions {
         if !m.is_empty() { obj["mentions"] = serde_json::json!(m); }
+    }
+    if let (Some(pt), Some(pf)) = (thread_parent_ts, thread_parent_from) {
+        obj["tpt"] = serde_json::json!(pt);
+        obj["tpf"] = serde_json::json!(pf);
     }
     obj.to_string()
 }
@@ -1772,6 +1918,8 @@ pub async fn send_group_message(
     reply_to: Option<ReplyInfo>,
     mentions: Option<Vec<String>>,
     payload_override: Option<String>,
+    thread_parent_ts: Option<i64>,
+    thread_parent_from: Option<String>,
     app: AppHandle,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
@@ -1801,7 +1949,7 @@ pub async fn send_group_message(
         obj["gid"] = serde_json::json!(&group_id);
         obj.to_string()
     } else {
-        encode_group_payload(&text, ts, &group_id, reply_to.as_ref(), mentions.as_deref())
+        encode_group_payload(&text, ts, &group_id, reply_to.as_ref(), mentions.as_deref(), thread_parent_ts, thread_parent_from.as_deref())
     };
     let (r_ts, r_from, r_text) = match &reply_to {
         Some(r) => (Some(r.ts), Some(r.from.clone()), Some(r.text.clone())),
@@ -1832,11 +1980,16 @@ pub async fn send_group_message(
         let (nonce, ct) = store::encrypt_content(&text, &session_key);
         let db = state.db.lock().unwrap();
         if let Some(ref conn) = *db {
-            let _ = crate::db::insert_group_sent(
+            if let Ok(rowid) = crate::db::insert_group_sent(
                 conn, &group_id, &my_user_id, ts, &nonce, &ct,
                 r_ts, r_from.as_deref(), r_text.as_deref(),
-                None, None, None, None, Some(text.as_str()), None,
-            );
+                None, None, None, None, None,
+                thread_parent_ts, thread_parent_from.as_deref(),
+            ) {
+                if let Some(fts) = state.fts_db.lock().unwrap().as_ref() {
+                    db::fts_insert(fts, rowid, &text);
+                }
+            }
         }
         return Ok(());
     }
@@ -1914,7 +2067,7 @@ pub async fn send_group_message(
     let (nonce, ct) = store::encrypt_content(&text, &session_key);
     let db = state.db.lock().unwrap();
     if let Some(ref conn) = *db {
-        let _ = crate::db::insert_group_sent(
+        if let Ok(rowid) = crate::db::insert_group_sent(
             conn,
             &group_id,
             &my_user_id,
@@ -1924,9 +2077,14 @@ pub async fn send_group_message(
             r_ts,
             r_from.as_deref(),
             r_text.as_deref(),
-            None, None, None, None,
-            Some(text.as_str()), None,
-        );
+            None, None, None, None, None,
+            thread_parent_ts,
+            thread_parent_from.as_deref(),
+        ) {
+            if let Some(fts) = state.fts_db.lock().unwrap().as_ref() {
+                db::fts_insert(fts, rowid, &text);
+            }
+        }
     }
 
     Ok(())
@@ -1946,6 +2104,99 @@ pub fn get_group_messages(
     get_messages(group_id, limit, before_id, app)
 }
 
+// ── get_thread_messages ───────────────────────────────────────────────────────
+
+/// Load all replies in a thread identified by (group_id, parent_ts).
+#[tauri::command]
+pub fn get_thread_messages(
+    group_id: String,
+    parent_ts: i64,
+    app: AppHandle,
+) -> Result<Vec<MessageView>, String> {
+    let state = app.state::<AppState>();
+
+    let user_id = {
+        let guard = state.identity.lock().unwrap();
+        guard.as_ref().ok_or("not registered")?.user_id.clone()
+    };
+    let session_key = state.session_key.lock().unwrap().clone();
+    let key = session_key.ok_or("not unlocked")?;
+
+    let rows = {
+        let db = state.db.lock().unwrap();
+        let conn = db.as_ref().ok_or("db not open")?;
+        db::get_thread_messages(conn, &group_id, parent_ts)?
+    };
+
+    let mut messages = Vec::with_capacity(rows.len());
+    for row in rows {
+        let nonce: [u8; 12] = row.nonce.try_into().map_err(|_| "invalid nonce in db")?;
+        let from = if row.direction == "sent" {
+            user_id.clone()
+        } else if let Some(ref sid) = row.sender_id {
+            sid.clone()
+        } else {
+            group_id.clone()
+        };
+        match row.file_id {
+            Some(ref fid) => {
+                if let Ok(key_json) = store::decrypt_content(&nonce, &row.ct, &key) {
+                    let file_key: Vec<u8> = serde_json::from_str(&key_json).unwrap_or_default();
+                    messages.push(MessageView {
+                        db_id: row.db_id,
+                        from,
+                        text: String::new(),
+                        ts: row.ts,
+                        id: row.smid.map(|v| v as u32),
+                        status: row.status,
+                        reply_to_ts: None,
+                        reply_to_from: None,
+                        reply_to_text: None,
+                        file_id: Some(fid.clone()),
+                        file_key: Some(file_key),
+                        file_name: row.file_name,
+                        file_mime: row.file_mime,
+                        file_size: row.file_size,
+                        thumb_data: row.thumb_data,
+                        group_id: row.group_id,
+                        sender_id: row.sender_id,
+                        thread_parent_ts: row.thread_parent_ts,
+                        thread_parent_from: row.thread_parent_from,
+                        thread_reply_count: 0,
+                    });
+                }
+            }
+            None => {
+                if let Ok(text) = store::decrypt_content(&nonce, &row.ct, &key) {
+                    messages.push(MessageView {
+                        db_id: row.db_id,
+                        from,
+                        text,
+                        ts: row.ts,
+                        id: row.smid.map(|v| v as u32),
+                        status: row.status,
+                        reply_to_ts: row.reply_to_ts,
+                        reply_to_from: row.reply_to_from,
+                        reply_to_text: row.reply_to_text,
+                        file_id: None,
+                        file_key: None,
+                        file_name: None,
+                        file_mime: None,
+                        file_size: None,
+                        thumb_data: None,
+                        group_id: row.group_id,
+                        sender_id: row.sender_id,
+                        thread_parent_ts: row.thread_parent_ts,
+                        thread_parent_from: row.thread_parent_from,
+                        thread_reply_count: 0,
+                    });
+                }
+            }
+        }
+    }
+    Ok(messages)
+}
+
 // ── search_messages ───────────────────────────────────────────────────────────
 
 /// Full-text search across all locally stored message plaintext (FTS5).
@@ -1962,9 +2213,14 @@ pub fn search_messages(
         return Ok(vec![]);
     }
     let state = app.state::<AppState>();
+    let hits_raw = {
+        let fts_guard = state.fts_db.lock().unwrap();
+        let Some(fts) = fts_guard.as_ref() else { return Ok(vec![]); };
+        db::fts_search(fts, &q, limit.unwrap_or(30))
+    };
     let db_guard = state.db.lock().unwrap();
     let conn = db_guard.as_ref().ok_or("not unlocked")?;
-    db::search_messages(conn, &q, limit.unwrap_or(30))
+    Ok(hits_raw.into_iter().filter_map(|(rowid, snippet)| db::get_message_meta(conn, rowid, snippet)).collect())
 }
 
 // ── send_group_file ───────────────────────────────────────────────────────────
@@ -2127,7 +2383,8 @@ pub async fn send_group_file(
             &db_nonce, &db_ct,
             None, None, None,
             Some(&file_id), Some(&file_name), Some(&mime_type), Some(file_size),
-            Some(file_name.as_str()), thumb_plain.as_deref(),
+            thumb_plain.as_deref(),
+            None, None,
         );
     }
 
@@ -2680,7 +2937,11 @@ pub async fn delete_message(
     {
         let db = state.db.lock().unwrap();
         if let Some(ref conn) = *db {
-            db::delete_message(conn, &peer_id, msg_ts)?;
+            if let Some(rowid) = db::delete_message(conn, &peer_id, msg_ts)? {
+                if let Some(fts) = state.fts_db.lock().unwrap().as_ref() {
+                    db::fts_delete(fts, rowid);
+                }
+            }
         }
     }
 
@@ -3237,10 +3498,17 @@ pub async fn set_screen_capture_protection(
 // ── Biometric unlock ──────────────────────────────────────────────────────────
 
 const KEYRING_SERVICE: &str = "veto-messenger";
+// Keyring account for the biometric wrap key.
+// The wrap key encrypts the session_key stored on disk; neither alone suffices.
+const BIO_WRAP_ACCOUNT_PREFIX: &str = "bio_";
 
 #[tauri::command]
 pub async fn has_biometric_unlock(app: AppHandle) -> bool {
     let state = app.state::<AppState>();
+    let dir = match store::data_dir(&app) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
     let user_id = {
         let guard = state.identity.lock().unwrap();
         match guard.as_ref() {
@@ -3248,39 +3516,86 @@ pub async fn has_biometric_unlock(app: AppHandle) -> bool {
             None => return false,
         }
     };
-    keyring::Entry::new(KEYRING_SERVICE, &user_id)
+    // Both the keyring wrap key AND the on-disk encrypted file must exist.
+    let account = format!("{BIO_WRAP_ACCOUNT_PREFIX}{user_id}");
+    let keyring_ok = keyring::Entry::new(KEYRING_SERVICE, &account)
         .map(|e| e.get_password().is_ok())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    let file_ok = dir.join("encrypted_session_key.bin").exists();
+    keyring_ok && file_ok
 }
 
 #[tauri::command]
 pub async fn save_biometric_unlock(app: AppHandle) -> Result<(), String> {
+    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit};
+    use rand::RngCore;
+
     let state = app.state::<AppState>();
-    let (user_id, key) = {
+    let dir = store::data_dir(&app)?;
+
+    let (user_id, session_key) = {
         let id = state.identity.lock().unwrap();
         let user_id = id.as_ref().ok_or("not registered")?.user_id.clone();
         let sk = state.session_key.lock().unwrap();
         let key = sk.clone().ok_or("not unlocked")?;
         (user_id, key)
     };
-    let entry = keyring::Entry::new(KEYRING_SERVICE, &user_id).map_err(|e| e.to_string())?;
-    entry.set_password(&hex::encode(key)).map_err(|e| e.to_string())
+
+    // Generate a fresh random wrap key.
+    let mut wrap_key = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut wrap_key);
+
+    // Encrypt session_key with wrap_key → nonce[12] || ciphertext → file.
+    let cipher = ChaCha20Poly1305::new(&wrap_key.into());
+    let mut nonce = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let ct = cipher
+        .encrypt((&nonce).into(), session_key.as_slice())
+        .map_err(|e| e.to_string())?;
+    let mut out = nonce.to_vec();
+    out.extend_from_slice(&ct);
+    tokio::fs::write(dir.join("encrypted_session_key.bin"), out)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Store wrap key in keyring — OS biometric challenge fires on read.
+    let account = format!("{BIO_WRAP_ACCOUNT_PREFIX}{user_id}");
+    let entry = keyring::Entry::new(KEYRING_SERVICE, &account).map_err(|e| e.to_string())?;
+    entry.set_password(&hex::encode(wrap_key)).map_err(|e| e.to_string())?;
+
+    // Delete any legacy entry that stored the session_key directly.
+    if let Ok(old) = keyring::Entry::new(KEYRING_SERVICE, &user_id) {
+        let _ = old.delete_credential();
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn delete_biometric_unlock(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
+    let dir = store::data_dir(&app)?;
     let user_id = {
         let guard = state.identity.lock().unwrap();
         guard.as_ref().ok_or("not registered")?.user_id.clone()
     };
-    let entry = keyring::Entry::new(KEYRING_SERVICE, &user_id).map_err(|e| e.to_string())?;
-    entry.delete_credential().map_err(|e| e.to_string())
+    let account = format!("{BIO_WRAP_ACCOUNT_PREFIX}{user_id}");
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &account) {
+        let _ = entry.delete_credential();
+    }
+    let _ = tokio::fs::remove_file(dir.join("encrypted_session_key.bin")).await;
+    // Also remove legacy entry if present.
+    if let Ok(old) = keyring::Entry::new(KEYRING_SERVICE, &user_id) {
+        let _ = old.delete_credential();
+    }
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn try_biometric_unlock(app: AppHandle) -> Result<bool, String> {
+    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit};
     use std::sync::atomic::Ordering;
+
     let dir = store::data_dir(&app)?;
     let state = app.state::<AppState>();
 
@@ -3292,23 +3607,41 @@ pub async fn try_biometric_unlock(app: AppHandle) -> Result<bool, String> {
         }
     };
 
-    // Retrieve stored key from OS keychain (triggers Windows Hello / Touch ID)
-    let key_hex = {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, &user_id).map_err(|e| e.to_string())?;
+    // Retrieve wrap key from keyring (OS biometric challenge fires here).
+    let wrap_hex = {
+        let account = format!("{BIO_WRAP_ACCOUNT_PREFIX}{user_id}");
+        let entry = keyring::Entry::new(KEYRING_SERVICE, &account).map_err(|e| e.to_string())?;
         match entry.get_password() {
             Ok(h) => h,
             Err(_) => return Ok(false),
         }
     };
 
-    let key_bytes = hex::decode(&key_hex).map_err(|_| "stored key is invalid".to_string())?;
-    if key_bytes.len() != 32 {
-        return Err("stored key has wrong length".into());
+    let wrap_bytes = hex::decode(&wrap_hex).map_err(|_| "stored wrap key is invalid".to_string())?;
+    if wrap_bytes.len() != 32 {
+        return Err("stored wrap key has wrong length".into());
+    }
+    let mut wrap_key = [0u8; 32];
+    wrap_key.copy_from_slice(&wrap_bytes);
+
+    // Decrypt session_key from encrypted_session_key.bin.
+    let enc_data = tokio::fs::read(dir.join("encrypted_session_key.bin"))
+        .await
+        .map_err(|_| "biometric credential file not found — please re-enroll".to_string())?;
+    if enc_data.len() < 13 {
+        return Err("biometric credential file is corrupted".into());
+    }
+    let cipher = ChaCha20Poly1305::new(&wrap_key.into());
+    let plain = cipher
+        .decrypt(enc_data[..12].into(), &enc_data[12..])
+        .map_err(|_| "failed to decrypt session key — unlock with password and re-enroll biometric".to_string())?;
+    if plain.len() != 32 {
+        return Err("decrypted key has wrong length".into());
     }
     let mut key = [0u8; 32];
-    key.copy_from_slice(&key_bytes);
+    key.copy_from_slice(&plain);
 
-    // Verify key by loading sessions (returns None if key is wrong)
+    // Verify key is correct by loading sessions (returns None if key is wrong).
     let sessions = store::load_sessions(&dir, &key)
         .await
         .ok_or_else(|| "biometric key mismatch — please unlock with password".to_string())?;
@@ -3321,14 +3654,15 @@ pub async fn try_biometric_unlock(app: AppHandle) -> Result<bool, String> {
     }
     *state.session_key.lock().unwrap() = Some(key);
 
-    let conn = db::open(&dir)?;
+    let conn = db::open(&dir, &key)?;
     let max = db::max_smid(&conn);
     state.msg_counter.store(max + 1, Ordering::Relaxed);
-    let key_bf = key;
-    db::backfill_fts(&conn, move |nonce, ct| store::decrypt_content(nonce, ct, &key_bf).ok());
+    let fts = db::create_fts_db();
+    db::build_fts_index(&conn, &fts, &key).ok();
+    *state.fts_db.lock().unwrap() = Some(fts);
     *state.db.lock().unwrap() = Some(conn);
 
-    // Start background TTL cleanup
+    // Start background TTL cleanup.
     let app2 = app.clone();
     tokio::spawn(async move {
         loop {
@@ -3731,11 +4065,16 @@ pub async fn send_channel_message(
     let (nonce, ct) = store::encrypt_content(&text, &session_key);
     let db = state.db.lock().unwrap();
     if let Some(ref conn) = *db {
-        let _ = crate::db::insert_group_sent(
+        if let Ok(rowid) = crate::db::insert_group_sent(
             conn, &channel_id, &my_user_id, ts, &nonce, &ct,
             r_ts, r_from.as_deref(), r_text.as_deref(),
-            None, None, None, None, Some(text.as_str()), None,
-        );
+            None, None, None, None, None,
+            None, None,
+        ) {
+            if let Some(fts) = state.fts_db.lock().unwrap().as_ref() {
+                db::fts_insert(fts, rowid, &text);
+            }
+        }
     }
 
     Ok(())
@@ -3784,7 +4123,7 @@ pub async fn send_rsvp(
     }
     let payload = serde_json::json!({ "rsvp": { "event_ts": event_ts, "status": status } }).to_string();
     // Re-use send_group_message with payload_override.
-    send_group_message(group_id, String::new(), None, None, Some(payload), app).await
+    send_group_message(group_id, String::new(), None, None, Some(payload), None, None, app).await
 }
 
 // ── C6 Message Scheduling ─────────────────────────────────────────────────────
@@ -3852,7 +4191,7 @@ async fn send_due_scheduled(app: &AppHandle) {
         } else if sm.is_group {
             send_group_message(
                 sm.peer_id.clone(), sm.text.clone(),
-                reply_to, mentions, None, app.clone(),
+                reply_to, mentions, None, None, None, app.clone(),
             ).await.map(|_| ())
         } else {
             send_message(
@@ -4132,4 +4471,66 @@ pub fn get_retention(peer_id: String, app: AppHandle) -> Result<i64, String> {
     let guard = state.db.lock().unwrap();
     let conn = guard.as_ref().ok_or("db not open")?;
     Ok(db::get_retention_count(conn, &peer_id))
+}
+
+// ── B6 Push notifications ─────────────────────────────────────────────────────
+
+/// Register a mobile push token with the server so offline push notifications
+/// can be delivered via FCM (Android) or APNs (iOS).
+/// Called from the frontend after the Tauri push-notification plugin fires its
+/// registration event with the device token.
+#[tauri::command]
+pub async fn register_push_token(
+    platform: String,
+    token: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    if !matches!(platform.as_str(), "fcm" | "apns") {
+        return Err("platform must be 'fcm' or 'apns'".into());
+    }
+    let state = app.state::<AppState>();
+    let (server_url, bearer) = {
+        let guard = state.identity.lock().unwrap();
+        let id = guard.as_ref().ok_or("not logged in")?;
+        (state.server_url.clone(), id.token.clone())
+    };
+
+    state
+        .http
+        .post(format!("{server_url}/api/v1/push/register"))
+        .bearer_auth(&bearer)
+        .json(&serde_json::json!({ "platform": platform, "token": token }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Unregister a push token (call on logout or when the user disables push).
+#[tauri::command]
+pub async fn unregister_push_token(
+    platform: String,
+    token: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let (server_url, bearer) = {
+        let guard = state.identity.lock().unwrap();
+        let id = guard.as_ref().ok_or("not logged in")?;
+        (state.server_url.clone(), id.token.clone())
+    };
+
+    state
+        .http
+        .post(format!("{server_url}/api/v1/push/unregister"))
+        .bearer_auth(&bearer)
+        .json(&serde_json::json!({ "platform": platform, "token": token }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
 }

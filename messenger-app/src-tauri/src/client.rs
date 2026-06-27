@@ -135,6 +135,10 @@ struct ParsedMessage {
     event_data: Option<serde_json::Value>,
     /// D8: RSVP payload.
     rsvp: Option<serde_json::Value>,
+    /// Thread: ts of the parent message (None for top-level messages).
+    thread_parent_ts: Option<i64>,
+    /// Thread: sender_id of the parent message.
+    thread_parent_from: Option<String>,
 }
 
 struct ParsedEdit {
@@ -187,6 +191,8 @@ fn parse_message_payload(s: &str, fallback_peer_id: &str) -> ParsedMessage {
         location: None,
         event_data: None,
         rsvp: None,
+        thread_parent_ts: None,
+        thread_parent_from: None,
     };
     let plain = |text: String| ParsedMessage { text, ..empty_reaction.clone() };
     if !s.starts_with('{') {
@@ -226,6 +232,8 @@ fn parse_message_payload(s: &str, fallback_peer_id: &str) -> ParsedMessage {
         location: Option<serde_json::Value>,
         event: Option<serde_json::Value>,
         rsvp: Option<serde_json::Value>,
+        tpt: Option<i64>,
+        tpf: Option<String>,
     }
     let Ok(msg) = serde_json::from_str::<V1Msg>(s) else {
         return plain(s.to_string());
@@ -336,6 +344,8 @@ fn parse_message_payload(s: &str, fallback_peer_id: &str) -> ParsedMessage {
             skd: None,
             mentions: vec![],
             sticker: None, location: None, event_data: None, rsvp: None,
+            thread_parent_ts: msg.tpt,
+            thread_parent_from: msg.tpf,
         };
     }
     // Text message.
@@ -357,6 +367,8 @@ fn parse_message_payload(s: &str, fallback_peer_id: &str) -> ParsedMessage {
             skd: None,
             mentions: msg.mentions.unwrap_or_default(),
             sticker: None, location: None, event_data: None, rsvp: None,
+            thread_parent_ts: msg.tpt,
+            thread_parent_from: msg.tpf,
         };
     }
     plain(s.to_string())
@@ -387,6 +399,8 @@ impl Clone for ParsedMessage {
             location: None,
             event_data: None,
             rsvp: None,
+            thread_parent_ts: self.thread_parent_ts,
+            thread_parent_from: self.thread_parent_from.clone(),
         }
     }
 }
@@ -581,14 +595,14 @@ fn handle_group_broadcast(app: &AppHandle, sender_id: &str, wire_frame: &[u8]) {
             let db = state.db.lock().unwrap();
             if let Some(ref conn) = *db {
                 let (nonce, ct) = store::encrypt_content(&parsed.text, key);
-                let _ = crate::db::insert_group_received(
+                if let Ok(Some(rowid)) = crate::db::insert_group_received(
                     conn,
                     gid,
                     sender_id,
                     ts,
                     &nonce,
                     &ct,
-                    None,  // no wire_hash (SK messages aren't DR-wrapped)
+                    None,
                     parsed.r_ts,
                     parsed.r_from.as_deref(),
                     parsed.r_text.as_deref(),
@@ -596,9 +610,15 @@ fn handle_group_broadcast(app: &AppHandle, sender_id: &str, wire_frame: &[u8]) {
                     None,
                     None,
                     None,
-                    Some(parsed.text.as_str()), None,
+                    None,
                     mentions_json.as_deref(),
-                );
+                    parsed.thread_parent_ts,
+                    parsed.thread_parent_from.as_deref(),
+                ) {
+                    if let Some(fts) = state.fts_db.lock().unwrap().as_ref() {
+                        crate::db::fts_insert(fts, rowid, &parsed.text);
+                    }
+                }
             }
         }
     }
@@ -617,12 +637,14 @@ fn handle_group_broadcast(app: &AppHandle, sender_id: &str, wire_frame: &[u8]) {
         "file_mime":    parsed.file_mime,
         "file_size":    parsed.file_size,
         "thumb_data":   parsed.thumb_data,
-        "mentions":     parsed.mentions,
-        "sticker":      parsed.sticker,
-        "location":     parsed.location,
-        "event_data":   parsed.event_data,
-        "rsvp":         parsed.rsvp,
-        "sk":           true,
+        "mentions":          parsed.mentions,
+        "sticker":           parsed.sticker,
+        "location":          parsed.location,
+        "event_data":        parsed.event_data,
+        "rsvp":              parsed.rsvp,
+        "thread_parent_ts":  parsed.thread_parent_ts,
+        "thread_parent_from": parsed.thread_parent_from,
+        "sk":                true,
     })).ok();
 
     // Emit mention event if current user is mentioned.
@@ -704,12 +726,16 @@ fn handle_channel_broadcast(app: &AppHandle, sender_id: &str, wire_frame: &[u8])
             let db = state.db.lock().unwrap();
             if let Some(ref conn) = *db {
                 let (nonce, ct) = store::encrypt_content(&parsed.text, key);
-                let _ = crate::db::insert_group_received(
+                if let Ok(Some(rowid)) = crate::db::insert_group_received(
                     conn, cid, sender_id, ts, &nonce, &ct, None,
                     parsed.r_ts, parsed.r_from.as_deref(), parsed.r_text.as_deref(),
-                    None, None, None, None,
-                    Some(parsed.text.as_str()), None, None,
-                );
+                    None, None, None, None, None, None,
+                    parsed.thread_parent_ts, parsed.thread_parent_from.as_deref(),
+                ) {
+                    if let Some(fts) = state.fts_db.lock().unwrap().as_ref() {
+                        crate::db::fts_insert(fts, rowid, &parsed.text);
+                    }
+                }
             }
         }
     }
@@ -790,10 +816,17 @@ pub async fn ws_loop(
     ws_stream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     app_handle: AppHandle,
     out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    auth_token: String,
 ) {
     let (mut sink, mut stream) = ws_stream.split();
     let mut out_rx = out_rx;
     let data_dir = store::data_dir(&app_handle).ok();
+
+    // Send auth frame as the very first WS message (token never in URL/logs).
+    let auth_msg = serde_json::json!({ "type": "auth", "token": auth_token }).to_string();
+    if sink.send(WsMessage::Text(auth_msg.into())).await.is_err() {
+        return;
+    }
 
     let send_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
@@ -946,15 +979,10 @@ pub async fn ws_loop(
                             if let Some(ref dir) = data_dir {
                                 let dir_clone = dir.clone();
                                 tokio::spawn(async move {
-                                    let path = dir_clone.join("identity.json");
-                                    let Ok(bytes) = tokio::fs::read(&path).await else { return };
-                                    let Ok(mut stored) =
-                                        serde_json::from_slice::<store::StoredIdentity>(&bytes)
-                                    else {
-                                        return;
-                                    };
+                                    let path = dir_clone.join("identity.bin");
+                                    let Some(mut stored) = store::load_identity(&path).await else { return };
                                     stored.opk_secrets.retain(|(id, _)| *id != consumed_id);
-                                    let _ = store::save(&path, &stored).await;
+                                    let _ = store::save_identity(&path, &stored).await;
                                 });
                             }
                         }
@@ -1113,9 +1141,10 @@ pub async fn ws_loop(
                                                     parsed.file_name.as_deref(),
                                                     parsed.file_mime.as_deref(),
                                                     parsed.file_size,
-                                                    parsed.file_name.as_deref(),
                                                     parsed.thumb_data.as_deref(),
                                                     None,
+                                                    parsed.thread_parent_ts,
+                                                    parsed.thread_parent_from.as_deref(),
                                                 );
                                             } else {
                                                 let _ = crate::db::insert_received(
@@ -1132,7 +1161,6 @@ pub async fn ws_loop(
                                                     parsed.file_name.as_deref(),
                                                     parsed.file_mime.as_deref(),
                                                     parsed.file_size,
-                                                    parsed.file_name.as_deref(),
                                                     parsed.thumb_data.as_deref(),
                                                     None,
                                                 );
@@ -1141,7 +1169,7 @@ pub async fn ws_loop(
                                         None => {
                                             let (nonce, ct) = store::encrypt_content(&parsed.text, key);
                                             if let Some(ref gid) = parsed.gid {
-                                                let _ = crate::db::insert_group_received(
+                                                if let Ok(Some(rowid)) = crate::db::insert_group_received(
                                                     conn,
                                                     gid,
                                                     &sender_id,
@@ -1156,11 +1184,17 @@ pub async fn ws_loop(
                                                     None,
                                                     None,
                                                     None,
-                                                    Some(parsed.text.as_str()), None,
+                                                    None,
                                                     mentions_json.as_deref(),
-                                                );
+                                                    parsed.thread_parent_ts,
+                                                    parsed.thread_parent_from.as_deref(),
+                                                ) {
+                                                    if let Some(fts) = state.fts_db.lock().unwrap().as_ref() {
+                                                        crate::db::fts_insert(fts, rowid, &parsed.text);
+                                                    }
+                                                }
                                             } else {
-                                                let _ = crate::db::insert_received(
+                                                if let Ok(Some(rowid)) = crate::db::insert_received(
                                                     conn,
                                                     &sender_id,
                                                     ts,
@@ -1174,9 +1208,13 @@ pub async fn ws_loop(
                                                     None,
                                                     None,
                                                     None,
-                                                    Some(parsed.text.as_str()), None,
+                                                    None,
                                                     mentions_json.as_deref(),
-                                                );
+                                                ) {
+                                                    if let Some(fts) = state.fts_db.lock().unwrap().as_ref() {
+                                                        crate::db::fts_insert(fts, rowid, &parsed.text);
+                                                    }
+                                                }
                                             }
                                         }
                                     }

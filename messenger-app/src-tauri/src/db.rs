@@ -19,9 +19,80 @@ fn exec(conn: &Connection, sql: &str) -> Result<(), String> {
     })
 }
 
-pub fn open(data_dir: &Path) -> Result<Connection, String> {
-    let conn = Connection::open(data_dir.join("messages.db"))
+/// Encrypt a plaintext `messages.db` in place using SQLCipher.
+/// Creates `messages.db.new` (encrypted), then renames `messages.db` → `messages.db.bak`
+/// and `messages.db.new` → `messages.db`. Idempotent: marker `.db_encrypted` guards re-runs.
+#[cfg(feature = "sqlcipher")]
+fn migrate_to_sqlcipher(data_dir: &Path, key: &[u8; 32]) -> Result<(), String> {
+    let db_path  = data_dir.join("messages.db");
+    let new_path = data_dir.join("messages.db.new");
+    let bak_path = data_dir.join("messages.db.bak");
+
+    // Open old plaintext DB (no key set = SQLCipher plaintext-compat mode).
+    let old_conn = Connection::open(&db_path)
+        .map_err(|e| format!("sqlcipher migration: open old db: {e}"))?;
+
+    // SQLite paths must use forward slashes (even on Windows).
+    let new_path_str = new_path
+        .to_str()
+        .ok_or_else(|| "sqlcipher migration: non-UTF8 path".to_string())?
+        .replace('\\', "/")
+        .replace('\'', "");     // guard against unlikely ' in path
+    let hex_key = hex::encode(key);
+
+    old_conn
+        .execute_batch(&format!(
+            "ATTACH DATABASE '{new_path_str}' AS encrypted KEY \"x'{hex_key}'\";"
+        ))
+        .map_err(|e| format!("sqlcipher migration: ATTACH: {e}"))?;
+
+    old_conn
+        .execute_batch("SELECT sqlcipher_export('encrypted');")
+        .map_err(|e| format!("sqlcipher migration: export: {e}"))?;
+
+    old_conn
+        .execute_batch("DETACH DATABASE encrypted;")
+        .map_err(|e| format!("sqlcipher migration: DETACH: {e}"))?;
+
+    drop(old_conn);
+
+    std::fs::rename(&db_path, &bak_path)
+        .map_err(|e| format!("sqlcipher migration: rename old: {e}"))?;
+    std::fs::rename(&new_path, &db_path)
+        .map_err(|e| format!("sqlcipher migration: rename new: {e}"))?;
+
+    Ok(())
+}
+
+pub fn open(data_dir: &Path, key: &[u8; 32]) -> Result<Connection, String> {
+    let db_path = data_dir.join("messages.db");
+
+    // Without the `sqlcipher` feature, the key is only used in the FTS build path.
+    // Suppress the compiler warning for the non-encrypted build.
+    #[cfg(not(feature = "sqlcipher"))]
+    let _ = key;
+
+    #[cfg(feature = "sqlcipher")]
+    {
+        // One-time migration: encrypt an existing plaintext DB.
+        let marker = data_dir.join(".db_encrypted");
+        if db_path.exists() && !marker.exists() {
+            migrate_to_sqlcipher(data_dir, key)?;
+            std::fs::File::create(&marker)
+                .map_err(|e| format!("db::open: create encryption marker: {e}"))?;
+        }
+    }
+
+    let conn = Connection::open(&db_path)
         .map_err(|e| format!("db::open connect: {e}"))?;
+
+    // PRAGMA key must be the first SQL issued on the connection (SQLCipher only).
+    #[cfg(feature = "sqlcipher")]
+    {
+        let hex_key = hex::encode(key);
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .map_err(|e| format!("db::open: SQLCipher key: {e}"))?;
+    }
 
     exec(&conn, "PRAGMA journal_mode=WAL;")?;
 
@@ -76,6 +147,8 @@ pub fn open(data_dir: &Path) -> Result<Connection, String> {
     let _ = conn.execute_batch("ALTER TABLE messages  ADD COLUMN edited_at   INTEGER;");
     let _ = conn.execute_batch("ALTER TABLE messages  ADD COLUMN edit_count  INTEGER NOT NULL DEFAULT 0;");
     let _ = conn.execute_batch("ALTER TABLE messages  ADD COLUMN mentions    TEXT;"); // JSON array of user_id strings
+    let _ = conn.execute_batch("ALTER TABLE messages  ADD COLUMN thread_parent_ts   INTEGER;");
+    let _ = conn.execute_batch("ALTER TABLE messages  ADD COLUMN thread_parent_from TEXT;");
 
     exec(&conn,
         "CREATE TABLE IF NOT EXISTS message_edits (\
@@ -97,25 +170,15 @@ pub fn open(data_dir: &Path) -> Result<Connection, String> {
         );",
     )?;
 
-    let fts_result = conn.execute_batch(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(\
-            plain, content=messages, content_rowid=id, \
-            tokenize='unicode61 remove_diacritics 2'\
-        );
-        CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-            INSERT INTO messages_fts(rowid, plain) VALUES (new.id, new.plain);
-        END;
-        CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-            INSERT INTO messages_fts(messages_fts, rowid, plain)
-            VALUES ('delete', old.id, old.plain);
-        END;
-        CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
-            INSERT INTO messages_fts(messages_fts, rowid, plain)
-            VALUES ('delete', old.id, old.plain);
-            INSERT INTO messages_fts(rowid, plain) VALUES (new.id, new.plain);
-        END;",
-    );
-    let _ = fts_result; // fts5 init may return a row — ignore the result
+    // Security migration: remove plaintext FTS that stored decrypted messages on disk.
+    // Plaintext search now lives in an in-memory FTS built at unlock time.
+    let _ = conn.execute_batch("
+        DROP TRIGGER IF EXISTS messages_ai;
+        DROP TRIGGER IF EXISTS messages_au;
+        DROP TRIGGER IF EXISTS messages_ad;
+        DROP TABLE  IF EXISTS messages_fts;
+        UPDATE messages SET plain = NULL;
+    ");
 
     exec(&conn,
         "CREATE TABLE IF NOT EXISTS sender_keys (\
@@ -232,21 +295,20 @@ pub fn insert_sent(
     file_name: Option<&str>,
     file_mime: Option<&str>,
     file_size: Option<i64>,
-    plain: Option<&str>,
     thumb_data: Option<&[u8]>,
-) -> Result<(), String> {
+) -> Result<i64, String> {
     conn.execute(
         "INSERT INTO messages \
          (peer_id, direction, ts, nonce, ct, status, smid, \
           reply_to_ts, reply_to_from, reply_to_text, \
-          file_id, file_name, file_mime, file_size, plain, thumb_data) \
-         VALUES (?1, 'sent', ?2, ?3, ?4, 'sent', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+          file_id, file_name, file_mime, file_size, thumb_data) \
+         VALUES (?1, 'sent', ?2, ?3, ?4, 'sent', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![peer_id, ts, nonce.as_slice(), ct, smid,
                 reply_to_ts, reply_to_from, reply_to_text,
-                file_id, file_name, file_mime, file_size, plain, thumb_data],
+                file_id, file_name, file_mime, file_size, thumb_data],
     )
-    .map_err(|e| e.to_string())
-    .map(|_| ())
+    .map_err(|e| e.to_string())?;
+    Ok(conn.last_insert_rowid())
 }
 
 /// Insert a received message, identified by its wire-frame SHA-256 hash.
@@ -266,24 +328,23 @@ pub fn insert_received(
     file_name: Option<&str>,
     file_mime: Option<&str>,
     file_size: Option<i64>,
-    plain: Option<&str>,
     thumb_data: Option<&[u8]>,
     mentions: Option<&str>,
-) -> Result<bool, String> {
+) -> Result<Option<i64>, String> {
     let rows = conn
         .execute(
             "INSERT OR IGNORE INTO messages \
              (peer_id, direction, ts, nonce, ct, status, msg_hash, \
               reply_to_ts, reply_to_from, reply_to_text, \
-              file_id, file_name, file_mime, file_size, plain, thumb_data, mentions) \
-             VALUES (?1, 'received', ?2, ?3, ?4, 'delivered', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+              file_id, file_name, file_mime, file_size, thumb_data, mentions) \
+             VALUES (?1, 'received', ?2, ?3, ?4, 'delivered', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![peer_id, ts, nonce.as_slice(), ct,
                     wire_hash.map(|h| h.as_slice()),
                     reply_to_ts, reply_to_from, reply_to_text,
-                    file_id, file_name, file_mime, file_size, plain, thumb_data, mentions],
+                    file_id, file_name, file_mime, file_size, thumb_data, mentions],
         )
         .map_err(|e| e.to_string())?;
-    Ok(rows > 0)
+    if rows > 0 { Ok(Some(conn.last_insert_rowid())) } else { Ok(None) }
 }
 
 /// Check whether a wire frame (identified by its SHA-256 hash) was already stored.
@@ -338,6 +399,9 @@ pub struct RawMessage {
     pub sender_id: Option<String>,
     pub thumb_data: Option<Vec<u8>>,
     pub mentions: Option<String>,
+    pub thread_parent_ts: Option<i64>,
+    pub thread_parent_from: Option<String>,
+    pub thread_reply_count: i64,
 }
 
 /// Return the highest smid stored for sent messages.
@@ -378,7 +442,11 @@ pub fn load_for_peer(
             "SELECT id, direction, ts, nonce, ct, status, smid, \
                     reply_to_ts, reply_to_from, reply_to_text, \
                     file_id, file_name, file_mime, file_size, \
-                    group_id, sender_id, thumb_data, mentions \
+                    group_id, sender_id, thumb_data, mentions, \
+                    thread_parent_ts, thread_parent_from, \
+                    (SELECT COUNT(*) FROM messages m2 \
+                     WHERE m2.peer_id = messages.peer_id \
+                       AND m2.thread_parent_ts = messages.ts) AS thread_reply_count \
              FROM messages WHERE peer_id = ?1 AND id < ?2 \
              ORDER BY id DESC LIMIT ?3",
         )
@@ -387,24 +455,27 @@ pub fn load_for_peer(
     let rows = stmt
         .query_map(params![peer_id, ceiling, limit], |row| {
             Ok(RawMessage {
-                db_id:         row.get(0)?,
-                direction:     row.get(1)?,
-                ts:            row.get(2)?,
-                nonce:         row.get(3)?,
-                ct:            row.get(4)?,
-                status:        row.get(5)?,
-                smid:          row.get(6)?,
-                reply_to_ts:   row.get(7)?,
-                reply_to_from: row.get(8)?,
-                reply_to_text: row.get(9)?,
-                file_id:       row.get(10)?,
-                file_name:     row.get(11)?,
-                file_mime:     row.get(12)?,
-                file_size:     row.get(13)?,
-                group_id:      row.get(14)?,
-                sender_id:     row.get(15)?,
-                thumb_data:    row.get(16)?,
-                mentions:      row.get(17)?,
+                db_id:              row.get(0)?,
+                direction:          row.get(1)?,
+                ts:                 row.get(2)?,
+                nonce:              row.get(3)?,
+                ct:                 row.get(4)?,
+                status:             row.get(5)?,
+                smid:               row.get(6)?,
+                reply_to_ts:        row.get(7)?,
+                reply_to_from:      row.get(8)?,
+                reply_to_text:      row.get(9)?,
+                file_id:            row.get(10)?,
+                file_name:          row.get(11)?,
+                file_mime:          row.get(12)?,
+                file_size:          row.get(13)?,
+                group_id:           row.get(14)?,
+                sender_id:          row.get(15)?,
+                thumb_data:         row.get(16)?,
+                mentions:           row.get(17)?,
+                thread_parent_ts:   row.get(18)?,
+                thread_parent_from: row.get(19)?,
+                thread_reply_count: row.get(20).unwrap_or(0),
             })
         })
         .map_err(|e| e.to_string())?;
@@ -430,102 +501,74 @@ pub fn insert_group_sent(
     file_name: Option<&str>,
     file_mime: Option<&str>,
     file_size: Option<i64>,
-    plain: Option<&str>,
     thumb_data: Option<&[u8]>,
-) -> Result<(), String> {
+    thread_parent_ts: Option<i64>,
+    thread_parent_from: Option<&str>,
+) -> Result<i64, String> {
     conn.execute(
         "INSERT INTO messages \
          (peer_id, direction, ts, nonce, ct, status, \
           reply_to_ts, reply_to_from, reply_to_text, \
           group_id, sender_id, \
-          file_id, file_name, file_mime, file_size, plain, thumb_data) \
-         VALUES (?1, 'sent', ?2, ?3, ?4, 'sent', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+          file_id, file_name, file_mime, file_size, thumb_data, \
+          thread_parent_ts, thread_parent_from) \
+         VALUES (?1, 'sent', ?2, ?3, ?4, 'sent', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![group_id, ts, nonce.as_slice(), ct,
                 reply_to_ts, reply_to_from, reply_to_text,
                 group_id, sender_id,
-                file_id, file_name, file_mime, file_size, plain, thumb_data],
+                file_id, file_name, file_mime, file_size, thumb_data,
+                thread_parent_ts, thread_parent_from],
     )
-    .map_err(|e| e.to_string())
-    .map(|_| ())
+    .map_err(|e| e.to_string())?;
+    Ok(conn.last_insert_rowid())
 }
 
-// ── FTS backfill ─────────────────────────────────────────────────────────────
 
-/// Populate the `plain` column (and thus the FTS index) for messages that were
-/// stored before the FTS migration. Called once at unlock with the session key.
-///
-/// `decrypt` receives `(nonce_12bytes, ciphertext)` and returns the plaintext
-/// string or `None` on error. This keeps db.rs free of crypto dependencies.
-///
-/// File messages are handled without decryption (plain = file_name).
-/// Text messages are decrypted; JSON-v1 payloads have their `text` field extracted.
-/// Returns the number of rows updated.
-pub fn backfill_fts(conn: &Connection, decrypt: impl Fn(&[u8; 12], &[u8]) -> Option<String>) -> usize {
-    // Step 1 — file messages: plain = file_name (already in plaintext columns).
-    let file_updated = conn
-        .execute(
-            "UPDATE messages SET plain = file_name \
-             WHERE plain IS NULL AND file_name IS NOT NULL",
-            [],
-        )
-        .unwrap_or(0);
-
-    // Step 2 — text messages: decrypt and store.
-    let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = conn
-        .prepare(
-            "SELECT id, nonce, ct FROM messages \
-             WHERE plain IS NULL AND file_name IS NULL \
-             ORDER BY id \
-             LIMIT 10000",
-        )
-        .and_then(|mut s| {
-            s.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-                .map(|it| it.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default();
-
-    let mut text_updated = 0usize;
-    for (id, nonce_bytes, ct) in rows {
-        let Ok(nonce): Result<[u8; 12], _> = nonce_bytes.try_into() else { continue };
-        let Some(plaintext) = decrypt(&nonce, &ct) else { continue };
-        let text: String = if plaintext.starts_with("{\"v\":1") {
-            serde_json::from_str::<serde_json::Value>(&plaintext)
-                .ok()
-                .and_then(|v| v["text"].as_str().map(|s| s.to_owned()))
-                .unwrap_or(plaintext)
-        } else {
-            plaintext
-        };
-        if text.is_empty() { continue; }
-        if conn.execute("UPDATE messages SET plain = ?1 WHERE id = ?2", params![text, id]).is_ok() {
-            text_updated += 1;
-        }
-    }
-
-    file_updated + text_updated
-}
-
-// ── Full-text search ──────────────────────────────────────────────────────────
+// ── Full-text search (in-memory) ──────────────────────────────────────────────
 
 #[derive(serde::Serialize)]
 pub struct SearchHit {
     pub db_id: i64,
-    /// peer_id (DM) or group_id (group chat) — use to switch conversation.
     pub peer_id: String,
     pub group_id: Option<String>,
     pub sender_id: Option<String>,
     pub ts: i64,
     pub direction: String,
-    /// Snippet with `<<` / `>>` around matched terms.
     pub snippet: String,
 }
 
-/// Full-text search across all decrypted message text.
-/// Returns at most `limit` results ordered by FTS5 relevance rank.
-/// Wraps FTS5 parse errors (bad query syntax) into an empty result set.
-pub fn search_messages(conn: &Connection, query: &str, limit: u32) -> Result<Vec<SearchHit>, String> {
-    // Add prefix wildcard to each token so partial words also match (e.g. "hel" → "hel*").
-    // Quoted phrases and existing wildcards are left untouched.
+/// Create an in-memory SQLite FTS5 database. Called at unlock, dropped at lock.
+pub fn create_fts_db() -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE messages_fts USING fts5(
+            content,
+            content='',
+            tokenize='unicode61 remove_diacritics 2'
+        );",
+    )
+    .expect("create fts5 table");
+    conn
+}
+
+/// Insert a plaintext message into the in-memory FTS index.
+pub fn fts_insert(fts: &rusqlite::Connection, rowid: i64, plain: &str) {
+    let _ = fts.execute(
+        "INSERT INTO messages_fts(rowid, content) VALUES (?, ?)",
+        rusqlite::params![rowid, plain],
+    );
+}
+
+/// Remove a message from the in-memory FTS index.
+pub fn fts_delete(fts: &rusqlite::Connection, rowid: i64) {
+    let _ = fts.execute(
+        "INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', ?, '')",
+        rusqlite::params![rowid],
+    );
+}
+
+/// Search the in-memory FTS index. Returns (rowid, snippet) pairs.
+pub fn fts_search(fts: &rusqlite::Connection, query: &str, limit: u32) -> Vec<(i64, String)> {
     let fts_query: String = if query.contains('"') {
         query.to_string()
     } else {
@@ -534,36 +577,67 @@ pub fn search_messages(conn: &Connection, query: &str, limit: u32) -> Result<Vec
             .collect::<Vec<_>>()
             .join(" ")
     };
-
-    let mut stmt = match conn.prepare(
-        "SELECT m.id, m.peer_id, m.group_id, m.sender_id, m.ts, m.direction, \
-                snippet(messages_fts, 0, '<<', '>>', '…', 8) \
-         FROM messages_fts \
-         JOIN messages m ON m.id = messages_fts.rowid \
-         WHERE messages_fts MATCH ?1 \
-         ORDER BY rank \
-         LIMIT ?2",
+    let mut stmt = match fts.prepare(
+        "SELECT rowid, snippet(messages_fts, 0, '<<', '>>', '…', 8) \
+         FROM messages_fts WHERE content MATCH ? ORDER BY rank LIMIT ?",
     ) {
         Ok(s) => s,
-        Err(e) => return Err(e.to_string()),
+        Err(_) => return vec![],
     };
+    stmt.query_map(rusqlite::params![fts_query, limit], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })
+    .map(|it| it.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
 
-    let hits = match stmt.query_map(params![fts_query, limit], |row| {
-        Ok(SearchHit {
-            db_id:     row.get(0)?,
-            peer_id:   row.get(1)?,
-            group_id:  row.get(2)?,
-            sender_id: row.get(3)?,
-            ts:        row.get(4)?,
-            direction: row.get(5)?,
-            snippet:   row.get(6)?,
-        })
-    }) {
-        Ok(iter) => iter,
-        Err(_) => return Ok(vec![]),
-    };
+/// Decrypt and index all messages from the main DB into the in-memory FTS at unlock.
+pub fn build_fts_index(
+    db: &Connection,
+    fts: &rusqlite::Connection,
+    session_key: &[u8; 32],
+) -> rusqlite::Result<()> {
+    use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit};
+    let cipher = ChaCha20Poly1305::new(session_key.into());
+    let mut stmt = db.prepare(
+        "SELECT id, nonce, ct FROM messages \
+         WHERE file_id IS NULL ORDER BY ts DESC LIMIT 10000",
+    )?;
+    let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+    for (id, nonce, ct) in rows {
+        if nonce.len() != 12 { continue; }
+        let nonce_arr: [u8; 12] = nonce.try_into().unwrap();
+        if let Ok(plain_bytes) = cipher.decrypt((&nonce_arr).into(), ct.as_slice()) {
+            if let Ok(plain) = String::from_utf8(plain_bytes) {
+                fts_insert(fts, id, &plain);
+            }
+        }
+    }
+    Ok(())
+}
 
-    Ok(hits.filter_map(|r| r.ok()).collect())
+/// Fetch message metadata from the main DB to build a SearchHit for a given rowid.
+pub fn get_message_meta(conn: &Connection, rowid: i64, snippet: String) -> Option<SearchHit> {
+    conn.query_row(
+        "SELECT id, peer_id, group_id, sender_id, ts, direction \
+         FROM messages WHERE id = ?1",
+        params![rowid],
+        |row| {
+            Ok(SearchHit {
+                db_id:     row.get(0)?,
+                peer_id:   row.get(1)?,
+                group_id:  row.get(2)?,
+                sender_id: row.get(3)?,
+                ts:        row.get(4)?,
+                direction: row.get(5)?,
+                snippet,
+            })
+        },
+    )
+    .ok()
 }
 
 // ── Conversation read-state ───────────────────────────────────────────────────
@@ -626,26 +700,90 @@ pub fn insert_group_received(
     file_name: Option<&str>,
     file_mime: Option<&str>,
     file_size: Option<i64>,
-    plain: Option<&str>,
     thumb_data: Option<&[u8]>,
     mentions: Option<&str>,
-) -> Result<bool, String> {
+    thread_parent_ts: Option<i64>,
+    thread_parent_from: Option<&str>,
+) -> Result<Option<i64>, String> {
     let rows = conn
         .execute(
             "INSERT OR IGNORE INTO messages \
              (peer_id, direction, ts, nonce, ct, status, msg_hash, \
               reply_to_ts, reply_to_from, reply_to_text, \
               group_id, sender_id, \
-              file_id, file_name, file_mime, file_size, plain, thumb_data, mentions) \
-             VALUES (?1, 'received', ?2, ?3, ?4, 'delivered', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+              file_id, file_name, file_mime, file_size, thumb_data, mentions, \
+              thread_parent_ts, thread_parent_from) \
+             VALUES (?1, 'received', ?2, ?3, ?4, 'delivered', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![group_id, ts, nonce.as_slice(), ct,
                     wire_hash.map(|h| h.as_slice()),
                     reply_to_ts, reply_to_from, reply_to_text,
                     group_id, sender_id,
-                    file_id, file_name, file_mime, file_size, plain, thumb_data, mentions],
+                    file_id, file_name, file_mime, file_size, thumb_data, mentions,
+                    thread_parent_ts, thread_parent_from],
         )
         .map_err(|e| e.to_string())?;
-    Ok(rows > 0)
+    if rows > 0 { Ok(Some(conn.last_insert_rowid())) } else { Ok(None) }
+}
+
+// ── Threads ───────────────────────────────────────────────────────────────────
+
+/// All replies in a thread (messages whose thread_parent_ts == parent_ts in the given group).
+pub fn get_thread_messages(
+    conn: &Connection,
+    group_id: &str,
+    parent_ts: i64,
+) -> Result<Vec<RawMessage>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, direction, ts, nonce, ct, status, smid, \
+                    reply_to_ts, reply_to_from, reply_to_text, \
+                    file_id, file_name, file_mime, file_size, \
+                    group_id, sender_id, thumb_data, mentions, \
+                    thread_parent_ts, thread_parent_from \
+             FROM messages WHERE peer_id = ?1 AND thread_parent_ts = ?2 \
+             ORDER BY id ASC",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let rows = stmt
+        .query_map(params![group_id, parent_ts], |row| {
+            Ok(RawMessage {
+                db_id:              row.get(0)?,
+                direction:          row.get(1)?,
+                ts:                 row.get(2)?,
+                nonce:              row.get(3)?,
+                ct:                 row.get(4)?,
+                status:             row.get(5)?,
+                smid:               row.get(6)?,
+                reply_to_ts:        row.get(7)?,
+                reply_to_from:      row.get(8)?,
+                reply_to_text:      row.get(9)?,
+                file_id:            row.get(10)?,
+                file_name:          row.get(11)?,
+                file_mime:          row.get(12)?,
+                file_size:          row.get(13)?,
+                group_id:           row.get(14)?,
+                sender_id:          row.get(15)?,
+                thumb_data:         row.get(16)?,
+                mentions:           row.get(17)?,
+                thread_parent_ts:   row.get(18)?,
+                thread_parent_from: row.get(19)?,
+                thread_reply_count: 0,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+/// Count replies in a thread.
+pub fn get_thread_reply_count(conn: &Connection, group_id: &str, parent_ts: i64) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE peer_id = ?1 AND thread_parent_ts = ?2",
+        params![group_id, parent_ts],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
 }
 
 // ── Reactions ─────────────────────────────────────────────────────────────────
