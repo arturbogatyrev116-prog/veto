@@ -71,6 +71,43 @@ pub struct Inner {
     pub fcm_token_cache: TokioMutex<Option<CachedToken>>,
 }
 
+fn load_fcm_service_account() -> Option<FcmServiceAccount> {
+    #[derive(serde::Deserialize)]
+    struct Sa { project_id: String, client_email: String, private_key: String }
+
+    fn parse(raw: &str, source: &str) -> Option<FcmServiceAccount> {
+        match serde_json::from_str::<Sa>(raw) {
+            Ok(sa) => Some(FcmServiceAccount {
+                project_id:   sa.project_id,
+                client_email: sa.client_email,
+                private_key:  sa.private_key,
+            }),
+            Err(e) => {
+                tracing::error!("{source}: FCM service account JSON parse failed: {e}");
+                None
+            }
+        }
+    }
+
+    // Priority 1: path to the file on disk (simplest for bare-metal / VPS).
+    if let Ok(path) = std::env::var("FCM_SERVICE_ACCOUNT_PATH") {
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => return parse(&raw, &format!("FCM_SERVICE_ACCOUNT_PATH={path}")),
+            Err(e) => {
+                tracing::error!("Cannot read FCM service account file {path}: {e}");
+                return None;
+            }
+        }
+    }
+
+    // Priority 2: JSON content directly in an env var (Docker secrets / k8s).
+    if let Ok(raw) = std::env::var("FCM_SERVICE_ACCOUNT_JSON") {
+        return parse(&raw, "FCM_SERVICE_ACCOUNT_JSON");
+    }
+
+    None
+}
+
 impl AppState {
     pub fn new(db: PgPool, nats_client: async_nats::Client, js: JetStream) -> Self {
         use sha2::{Digest, Sha256};
@@ -84,22 +121,7 @@ impl AppState {
 
         let libretranslate_url = std::env::var("LIBRETRANSLATE_URL").ok();
 
-        let fcm_service_account = std::env::var("FCM_SERVICE_ACCOUNT_JSON").ok()
-            .and_then(|raw| {
-                #[derive(serde::Deserialize)]
-                struct Sa { project_id: String, client_email: String, private_key: String }
-                match serde_json::from_str::<Sa>(&raw) {
-                    Ok(sa) => Some(FcmServiceAccount {
-                        project_id:   sa.project_id,
-                        client_email: sa.client_email,
-                        private_key:  sa.private_key,
-                    }),
-                    Err(e) => {
-                        tracing::error!("FCM_SERVICE_ACCOUNT_JSON parse failed: {e}");
-                        None
-                    }
-                }
-            });
+        let fcm_service_account = load_fcm_service_account();
         if fcm_service_account.is_some() {
             tracing::info!("FCM v1 push enabled");
         }
