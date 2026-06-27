@@ -1,6 +1,5 @@
 use reqwest::Client;
 use serde::Deserialize;
-use sqlx::PgPool;
 
 use crate::state::{AppState, CachedToken, FcmServiceAccount};
 

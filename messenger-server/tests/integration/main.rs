@@ -188,14 +188,8 @@ async fn alice_to_bob_happy_path() {
     let mut bob = RatchetState::init_bob(&bob_sk, StaticSecret::from(bob_spk_bytes));
 
     // Both connect via WebSocket.
-    let (mut alice_ws, _) =
-        tokio_tungstenite::connect_async(format!("ws://{addr}/ws?token={alice_token}"))
-            .await
-            .unwrap();
-    let (mut bob_ws, _) =
-        tokio_tungstenite::connect_async(format!("ws://{addr}/ws?token={bob_token}"))
-            .await
-            .unwrap();
+    let mut alice_ws = common::ws_connect(addr, &alice_token).await;
+    let mut bob_ws = common::ws_connect(addr, &bob_token).await;
 
     let ad = b"alice-bob-v1";
 
@@ -258,10 +252,7 @@ async fn offline_delivery() {
     let (bob_id, bob_token) = common::register(addr, "bob_offline").await;
 
     // Only Alice connects.
-    let (mut alice_ws, _) =
-        tokio_tungstenite::connect_async(format!("ws://{addr}/ws?token={alice_token}"))
-            .await
-            .unwrap();
+    let mut alice_ws = common::ws_connect(addr, &alice_token).await;
 
     let payload = b"queued_for_bob";
     alice_ws
@@ -272,10 +263,7 @@ async fn offline_delivery() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Bob connects — queued message should be delivered immediately.
-    let (mut bob_ws, _) =
-        tokio_tungstenite::connect_async(format!("ws://{addr}/ws?token={bob_token}"))
-            .await
-            .unwrap();
+    let mut bob_ws = common::ws_connect(addr, &bob_token).await;
 
     let received = timeout(Duration::from_secs(3), next_binary(&mut bob_ws))
         .await
@@ -369,14 +357,8 @@ async fn concurrent_100_messages() {
     let bob_sk = x3dh_receive(&bob_identity, &bob_spk, None, &x3dh_header, pq_ct.as_deref(), None).unwrap();
     let mut bob = RatchetState::init_bob(&bob_sk, StaticSecret::from(bob_spk_bytes));
 
-    let (mut alice_ws, _) =
-        tokio_tungstenite::connect_async(format!("ws://{addr}/ws?token={alice_token}"))
-            .await
-            .unwrap();
-    let (mut bob_ws, _) =
-        tokio_tungstenite::connect_async(format!("ws://{addr}/ws?token={bob_token}"))
-            .await
-            .unwrap();
+    let mut alice_ws = common::ws_connect(addr, &alice_token).await;
+    let mut bob_ws = common::ws_connect(addr, &bob_token).await;
 
     let ad = b"bulk-100";
     const N: usize = 100;

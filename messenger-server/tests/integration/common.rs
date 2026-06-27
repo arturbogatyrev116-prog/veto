@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
 
+use futures_util::SinkExt;
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use messenger_server::{nats, routes, state::AppState};
 
@@ -57,6 +59,25 @@ pub async fn register(addr: SocketAddr, username: &str) -> (String, String) {
         body["user_id"].as_str().unwrap().to_owned(),
         body["token"].as_str().unwrap().to_owned(),
     )
+}
+
+/// Connect to the WebSocket and authenticate via first-message auth frame.
+/// Returns the authenticated WebSocket stream ready for use.
+pub async fn ws_connect(
+    addr: SocketAddr,
+    token: &str,
+) -> tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+> {
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("ws connect");
+    ws.send(WsMessage::Text(
+        serde_json::json!({ "type": "auth", "token": token }).to_string().into(),
+    ))
+    .await
+    .expect("ws auth frame");
+    ws
 }
 
 fn unique_id() -> String {
