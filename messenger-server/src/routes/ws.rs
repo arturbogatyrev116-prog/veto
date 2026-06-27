@@ -1,10 +1,11 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State,
+        State,
     },
     response::IntoResponse,
 };
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -12,7 +13,7 @@ use sqlx::FromRow;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::{error::AppError, state::AppState};
+use crate::state::AppState;
 
 /// Client → server Sender Key group broadcast frame.
 /// Format: [GROUP_MAGIC: 4B][4B gid_len][gid UTF-8][payload]
@@ -58,11 +59,6 @@ pub fn notify_member_left(state: &AppState, gid: &str, leaver_id: &str, remainin
     }
 }
 
-#[derive(Deserialize)]
-pub struct WsQuery {
-    pub token: String,
-}
-
 #[derive(FromRow)]
 struct TokenRow {
     user_id: Uuid,
@@ -70,35 +66,75 @@ struct TokenRow {
 
 pub async fn handler(
     ws: WebSocketUpgrade,
-    Query(q): Query<WsQuery>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, AppError> {
-    let token_hash: Vec<u8> = Sha256::digest(q.token.as_bytes()).to_vec();
-
-    let row = sqlx::query_as::<_, TokenRow>(
-        "SELECT user_id FROM auth_tokens WHERE token_hash = $1",
-    )
-    .bind(token_hash.as_slice())
-    .fetch_optional(&state.inner.db)
-    .await
-    .map_err(|_| AppError::Unauthorized)?;
-
-    let user_id = row.ok_or(AppError::Unauthorized)?.user_id.to_string();
-
-    Ok(ws.on_upgrade(move |socket| handle(socket, user_id, state)))
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle(socket, state))
 }
 
-async fn handle(socket: WebSocket, user_id: String, state: AppState) {
+async fn handle(socket: WebSocket, state: AppState) {
+    let (mut sink, mut stream) = socket.split();
+
+    // Auth phase: first Text message must be {"type":"auth","token":"<bearer>"}
+    #[derive(Deserialize)]
+    struct AuthFrame { token: String }
+
+    let user_id = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        async {
+            while let Some(Ok(msg)) = stream.next().await {
+                if let Message::Text(text) = msg {
+                    if let Ok(af) = serde_json::from_str::<AuthFrame>(&text) {
+                        let hash = Sha256::digest(af.token.as_bytes()).to_vec();
+                        let row = sqlx::query_as::<_, TokenRow>(
+                            "SELECT user_id FROM auth_tokens WHERE token_hash = $1",
+                        )
+                        .bind(hash.as_slice())
+                        .fetch_optional(&state.inner.db)
+                        .await
+                        .ok()
+                        .flatten();
+                        if let Some(r) = row {
+                            return Some(r.user_id.to_string());
+                        }
+                    }
+                }
+            }
+            None
+        },
+    )
+    .await
+    .ok()
+    .flatten();
+
+    let Some(user_id) = user_id else {
+        tracing::warn!("WebSocket: auth failed or timed out, closing");
+        return;
+    };
+
     let (tx, rx) = mpsc::unbounded_channel::<Message>();
     state.inner.sessions.insert(user_id.clone(), tx);
     tracing::info!(user_id, "client connected");
 
-    // Tell the joining user who is already online.
+    // Fetch contacts (users sharing at least one group) to restrict presence visibility.
+    let contacts: std::collections::HashSet<String> = sqlx::query_scalar(
+        "SELECT DISTINCT gm2.user_id::text \
+         FROM group_members gm1 \
+         JOIN group_members gm2 ON gm1.group_id = gm2.group_id \
+         WHERE gm1.user_id = $1 AND gm2.user_id != $1",
+    )
+    .bind(&user_id)
+    .fetch_all(&state.inner.db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .collect();
+
+    // Tell the joining user only which contacts are already online.
     let online_users: Vec<String> = state
         .inner
         .sessions
         .iter()
-        .filter(|e| e.key() != &user_id)
+        .filter(|e| e.key() != &user_id && contacts.contains(e.key()))
         .map(|e| e.key().clone())
         .collect();
     let hello = serde_json::json!({ "type": "hello", "online_users": online_users }).to_string();
@@ -106,18 +142,16 @@ async fn handle(socket: WebSocket, user_id: String, state: AppState) {
         let _ = self_tx.send(Message::Text(hello.into()));
     }
 
-    // Announce this user's arrival to everyone else.
+    // Announce arrival only to contacts.
     let joined = serde_json::json!({ "type": "presence", "user_id": user_id, "online": true })
         .to_string();
     for entry in state.inner.sessions.iter() {
-        if entry.key() != &user_id {
+        if entry.key() != &user_id && contacts.contains(entry.key()) {
             let _ = entry.send(Message::Text(joined.clone().into()));
         }
     }
 
     let pending = crate::nats::drain_pending(&state.inner.js, &user_id).await;
-
-    let (mut sink, mut stream) = socket.split();
 
     let send_task = tokio::spawn(async move {
         for payload in pending {
@@ -160,11 +194,13 @@ async fn handle(socket: WebSocket, user_id: String, state: AppState) {
     send_task.abort();
     tracing::info!(user_id, "client disconnected");
 
-    // Announce departure to remaining connected users.
+    // Announce departure only to contacts.
     let left = serde_json::json!({ "type": "presence", "user_id": user_id, "online": false })
         .to_string();
     for entry in state.inner.sessions.iter() {
-        let _ = entry.send(Message::Text(left.clone().into()));
+        if contacts.contains(entry.key()) {
+            let _ = entry.send(Message::Text(left.clone().into()));
+        }
     }
 }
 
@@ -178,7 +214,7 @@ async fn route_group_message(state: &AppState, frame: &[u8], sender_id: &str) {
         tracing::warn!("group broadcast frame too short");
         return;
     }
-    let gid_len = u32::from_be_bytes(after_magic[..4].try_into().unwrap()) as usize;
+    let gid_len = u32::from_be_bytes(after_magic[..4].try_into().expect("4 bytes")) as usize;
     if after_magic.len() < 4 + gid_len {
         tracing::warn!("group broadcast frame: gid truncated");
         return;
@@ -208,22 +244,23 @@ async fn route_group_message(state: &AppState, frame: &[u8], sender_id: &str) {
 
     // Build outgoing payload: [4B sender_len][sender_id][frame_as_received]
     let sid = sender_id.as_bytes();
-    let mut payload = Vec::with_capacity(4 + sid.len() + frame.len());
-    payload.extend_from_slice(&(sid.len() as u32).to_be_bytes());
-    payload.extend_from_slice(sid);
-    payload.extend_from_slice(frame);   // includes GROUP_MAGIC + gid + payload
+    let mut payload_vec = Vec::with_capacity(4 + sid.len() + frame.len());
+    payload_vec.extend_from_slice(&(sid.len() as u32).to_be_bytes());
+    payload_vec.extend_from_slice(sid);
+    payload_vec.extend_from_slice(frame);   // includes GROUP_MAGIC + gid + payload
+    let payload: Bytes = payload_vec.into(); // ref-counted; clone is O(1)
 
     for member_id in &members {
         if member_id == sender_id {
             continue; // Don't echo back to sender
         }
         if let Some(tx) = state.inner.sessions.get(member_id) {
-            if tx.send(Message::Binary(payload.clone().into())).is_err() {
+            if tx.send(Message::Binary(payload.clone())).is_err() {
                 drop(tx);
-                enqueue_offline(state, member_id, payload.clone());
+                enqueue_offline(state, member_id, payload.to_vec());
             }
         } else {
-            enqueue_offline(state, member_id, payload.clone());
+            enqueue_offline(state, member_id, payload.to_vec());
         }
     }
     tracing::info!(gid, sender_id, members = members.len(), "group broadcast");
@@ -258,20 +295,21 @@ async fn route_channel_message(state: &AppState, frame: &[u8], sender_id: &str) 
 
     // Build outgoing frame (same as group broadcast — sender prepended).
     let sid = sender_id.as_bytes();
-    let mut payload = Vec::with_capacity(4 + sid.len() + frame.len());
-    payload.extend_from_slice(&(sid.len() as u32).to_be_bytes());
-    payload.extend_from_slice(sid);
-    payload.extend_from_slice(frame);
+    let mut payload_vec = Vec::with_capacity(4 + sid.len() + frame.len());
+    payload_vec.extend_from_slice(&(sid.len() as u32).to_be_bytes());
+    payload_vec.extend_from_slice(sid);
+    payload_vec.extend_from_slice(frame);
+    let payload: Bytes = payload_vec.into();
 
     for member_id in &subscriber_ids {
         if member_id == sender_id { continue; }
         if let Some(tx) = state.inner.sessions.get(member_id) {
-            if tx.send(Message::Binary(payload.clone().into())).is_err() {
+            if tx.send(Message::Binary(payload.clone())).is_err() {
                 drop(tx);
-                enqueue_offline(state, member_id, payload.clone());
+                enqueue_offline(state, member_id, payload.to_vec());
             }
         } else {
-            enqueue_offline(state, member_id, payload.clone());
+            enqueue_offline(state, member_id, payload.to_vec());
         }
     }
     tracing::info!(gid, cid = cid_str, sender_id, subs = subscriber_ids.len(), "channel broadcast");
@@ -280,7 +318,7 @@ async fn route_channel_message(state: &AppState, frame: &[u8], sender_id: &str) 
 /// Parse `[4B BE len][str bytes][rest]` — helper shared by channel/group routing.
 fn parse_u32_len_prefix(data: &[u8]) -> Option<(&str, &[u8])> {
     if data.len() < 4 { return None; }
-    let len = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
+    let len = u32::from_be_bytes(data[..4].try_into().expect("4 bytes")) as usize;
     if data.len() < 4 + len { return None; }
     let s = std::str::from_utf8(&data[4..4 + len]).ok()?;
     Some((s, &data[4 + len..]))
@@ -306,7 +344,7 @@ fn route_message(state: &AppState, frame: &[u8], sender_id: &str) {
             return;
         }
     };
-    let msg_id = u32::from_be_bytes(frame[header_end..header_end + 4].try_into().unwrap());
+    let msg_id = u32::from_be_bytes(frame[header_end..header_end + 4].try_into().expect("4 bytes"));
     let wire_frame = &frame[header_end + 4..];
 
     // Prepend the server-verified sender_id so the recipient can trust it.
@@ -338,8 +376,19 @@ fn route_message(state: &AppState, frame: &[u8], sender_id: &str) {
 
 fn enqueue_offline(state: &AppState, recipient_id: &str, payload: Vec<u8>) {
     let js = state.inner.js.clone();
-    let recipient_id = recipient_id.to_string();
+    let recip_nats = recipient_id.to_string();
+
+    // Durable NATS offline queue.
     tokio::spawn(async move {
-        crate::nats::publish(&js, &recipient_id, payload).await;
+        crate::nats::publish(&js, &recip_nats, payload).await;
     });
+
+    // Fire-and-forget push notification — only when service account is configured.
+    if state.inner.fcm_service_account.is_some() {
+        let state = state.clone();
+        let recipient_id = recipient_id.to_string();
+        tokio::spawn(async move {
+            crate::push::send_push_to_user(&state, &recipient_id).await;
+        });
+    }
 }

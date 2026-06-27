@@ -4,9 +4,22 @@ use axum::extract::ws::Message;
 use dashmap::DashMap;
 use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 use sqlx::PgPool;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex as TokioMutex};
 
 use crate::nats::JetStream;
+
+/// Parsed Firebase service account (loaded from FCM_SERVICE_ACCOUNT_JSON env var).
+pub struct FcmServiceAccount {
+    pub project_id:   String,
+    pub client_email: String,
+    pub private_key:  String,
+}
+
+/// Cached OAuth2 access token for FCM v1 API.
+pub struct CachedToken {
+    pub token:      String,
+    pub expires_at: i64,  // Unix seconds
+}
 
 pub type UserId = String;
 pub type Tx = mpsc::UnboundedSender<Message>;
@@ -49,6 +62,13 @@ pub struct Inner {
 
     /// Per-user translation rate limiter: 30 requests/minute per user_id.
     pub translate_limiter: DefaultKeyedRateLimiter<String>,
+
+    /// Firebase service account for FCM HTTP v1 API.
+    /// Loaded from FCM_SERVICE_ACCOUNT_JSON env var. None = push disabled.
+    pub fcm_service_account: Option<FcmServiceAccount>,
+
+    /// Cached OAuth2 access token — refreshed automatically when expired.
+    pub fcm_token_cache: TokioMutex<Option<CachedToken>>,
 }
 
 impl AppState {
@@ -63,6 +83,27 @@ impl AppState {
             .unwrap_or(false);
 
         let libretranslate_url = std::env::var("LIBRETRANSLATE_URL").ok();
+
+        let fcm_service_account = std::env::var("FCM_SERVICE_ACCOUNT_JSON").ok()
+            .and_then(|raw| {
+                #[derive(serde::Deserialize)]
+                struct Sa { project_id: String, client_email: String, private_key: String }
+                match serde_json::from_str::<Sa>(&raw) {
+                    Ok(sa) => Some(FcmServiceAccount {
+                        project_id:   sa.project_id,
+                        client_email: sa.client_email,
+                        private_key:  sa.private_key,
+                    }),
+                    Err(e) => {
+                        tracing::error!("FCM_SERVICE_ACCOUNT_JSON parse failed: {e}");
+                        None
+                    }
+                }
+            });
+        if fcm_service_account.is_some() {
+            tracing::info!("FCM v1 push enabled");
+        }
+
         let global_quota = Quota::per_second(NonZeroU32::new(10).expect("10 > 0"));
         let translate_quota = Quota::per_minute(NonZeroU32::new(30).expect("30 > 0"));
         Self {
@@ -78,6 +119,8 @@ impl AppState {
                 http_client: reqwest::Client::new(),
                 libretranslate_url,
                 translate_limiter: RateLimiter::keyed(translate_quota),
+                fcm_service_account,
+                fcm_token_cache: TokioMutex::new(None),
             }),
         }
     }
